@@ -4,6 +4,12 @@ All notable changes to Codex-X will be documented here.
 
 ## [Unreleased]
 
+## [v0.3.13] - 2026-08-18
+
+### 修复 Bug
+
+- 修复归档会话被错误标记为“待同步”并参与供应商同步的问题；归档会话现在会保持归档状态，不再作为同步候选。
+
 ## [v0.3.12] - 2026-08-11
 
 ### 更新

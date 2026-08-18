@@ -62,6 +62,7 @@ pub(super) fn is_canonical_rollout_storage_path(codex_dir: &Path, path: &Path) -
 fn referenced_rollout_paths(
     codex_dir: &Path,
     rollout_paths_by_thread_id: &HashMap<String, String>,
+    include_archived_storage: bool,
     failures: &mut Vec<String>,
 ) -> HashMap<PathBuf, HashSet<String>> {
     let mut referenced = HashMap::<PathBuf, HashSet<String>>::new();
@@ -106,11 +107,23 @@ fn referenced_rollout_paths(
                 continue;
             }
         };
-        if !is_canonical_rollout_storage_path(codex_dir, &canonical) {
-            failures.push(format!(
-                "活动 SQLite 引用的会话文件超出 Codex 会话目录: {}",
-                path.display()
-            ));
+        let within_codex_storage = is_canonical_rollout_storage_path(codex_dir, &canonical);
+        let allowed_root = if include_archived_storage {
+            within_codex_storage
+        } else {
+            within_codex_storage
+                && codex_dir
+                    .join("sessions")
+                    .canonicalize()
+                    .is_ok_and(|root| canonical.starts_with(root))
+        };
+        if !allowed_root {
+            let reason = if within_codex_storage {
+                "活动 SQLite 引用了归档会话文件"
+            } else {
+                "活动 SQLite 引用的会话文件超出 Codex 会话目录"
+            };
+            failures.push(format!("{reason}: {}", path.display()));
             continue;
         }
         let expected_thread_ids = referenced.entry(canonical.clone()).or_default();
@@ -181,7 +194,22 @@ fn is_locked_io_error(error: &std::io::Error) -> bool {
 }
 
 pub(crate) fn scan_rollouts(codex_dir: &Path, target_provider: &str) -> Result<RolloutScan> {
-    scan_rollouts_with_thread_filter(codex_dir, target_provider, None, None)
+    scan_rollouts_with_thread_filter(codex_dir, target_provider, None, None, true, None)
+}
+
+pub(super) fn scan_provider_rollouts(
+    codex_dir: &Path,
+    target_provider: &str,
+    archived_thread_ids: &HashSet<String>,
+) -> Result<RolloutScan> {
+    scan_rollouts_with_thread_filter(
+        codex_dir,
+        target_provider,
+        None,
+        None,
+        false,
+        Some(archived_thread_ids),
+    )
 }
 
 pub(super) fn scan_rollouts_for_thread_ids(
@@ -195,6 +223,8 @@ pub(super) fn scan_rollouts_for_thread_ids(
         target_provider,
         Some(thread_ids),
         Some(rollout_paths_by_thread_id),
+        false,
+        None,
     )
 }
 
@@ -203,15 +233,33 @@ fn scan_rollouts_with_thread_filter(
     target_provider: &str,
     allowed_thread_ids: Option<&HashSet<String>>,
     rollout_paths_by_thread_id: Option<&HashMap<String, String>>,
+    include_archived_storage: bool,
+    excluded_thread_ids: Option<&HashSet<String>>,
 ) -> Result<RolloutScan> {
     let mut paths = Vec::new();
     let mut scan = RolloutScan::default();
     let mut referenced = HashMap::new();
-    for dir in ["sessions", "archived_sessions"] {
-        collect_rollout_paths(&codex_dir.join(dir), &mut paths, &mut scan.scan_failures);
+    collect_rollout_paths(
+        &codex_dir.join("sessions"),
+        &mut paths,
+        &mut scan.scan_failures,
+    );
+    if include_archived_storage {
+        collect_rollout_paths(
+            &codex_dir.join("archived_sessions"),
+            &mut paths,
+            &mut scan.scan_failures,
+        );
     }
     paths.sort();
     scan.discovered_rollout_files = paths.len();
+    if let Some(excluded_thread_ids) = excluded_thread_ids {
+        paths.retain(|path| {
+            !excluded_thread_ids
+                .iter()
+                .any(|id| rollout_filename_matches_id(path, id))
+        });
+    }
     if let Some(allowed_thread_ids) = allowed_thread_ids {
         let empty_rollout_paths = HashMap::new();
         let rollout_paths_by_thread_id = rollout_paths_by_thread_id.unwrap_or(&empty_rollout_paths);
@@ -223,6 +271,7 @@ fn scan_rollouts_with_thread_filter(
         referenced = referenced_rollout_paths(
             codex_dir,
             rollout_paths_by_thread_id,
+            include_archived_storage,
             &mut scan.scan_failures,
         );
         paths.retain(|path| {
@@ -311,6 +360,12 @@ fn scan_rollouts_with_thread_filter(
             next_text.push_str(line_ending);
         }
 
+        if thread_id
+            .as_ref()
+            .is_some_and(|id| excluded_thread_ids.is_some_and(|excluded| excluded.contains(id)))
+        {
+            continue;
+        }
         if invalid_json_lines > 0 {
             scan.scan_failures.push(format!(
                 "会话文件包含 {invalid_json_lines} 行无法解析的 JSON: {}",
@@ -353,6 +408,7 @@ fn scan_rollouts_with_thread_filter(
             continue;
         }
         scan.session_meta_count += file_session_meta_count;
+        scan.thread_ids.insert(thread_id.clone());
         if let Some(cwd) = cwd {
             scan.cwd_by_thread_id.insert(thread_id.clone(), cwd);
         }
@@ -940,6 +996,7 @@ pub(super) struct SqliteThreadIndexState<'a> {
     pub(super) provider: Option<&'a str>,
     pub(super) cwd: Option<&'a str>,
     pub(super) cwd_column: bool,
+    pub(super) archived: bool,
 }
 
 pub(super) fn sqlite_thread_needs_alignment(
@@ -947,6 +1004,9 @@ pub(super) fn sqlite_thread_needs_alignment(
     target_provider: &str,
     state: &SqliteThreadIndexState<'_>,
 ) -> bool {
+    if state.archived {
+        return false;
+    }
     if state.provider.map(str::trim).unwrap_or_default() != target_provider {
         return true;
     }
@@ -979,6 +1039,8 @@ pub(super) fn scan_sqlite_with_paths(
 ) -> Result<SqliteScan> {
     let mut scan = SqliteScan::default();
     let mut thread_ids = HashSet::new();
+    let mut syncable_thread_ids = HashSet::new();
+    let mut archived_thread_ids = HashSet::new();
     let mut rollout_paths_by_thread_id = HashMap::new();
     let mut subagent_ids = HashSet::new();
     let mut mismatched_ids = HashSet::new();
@@ -1008,8 +1070,10 @@ pub(super) fn scan_sqlite_with_paths(
         scan.sqlite_dbs += 1;
         let cwd_col = sql_select_column(&cols, "cwd", "NULL");
         let rollout_col = sql_select_column(&cols, "rollout_path", "NULL");
-        let query =
-            format!("SELECT \"id\", \"model_provider\", {cwd_col}, {rollout_col} FROM threads");
+        let archived_col = sql_select_column(&cols, "archived", "0");
+        let query = format!(
+            "SELECT \"id\", \"model_provider\", {cwd_col}, {rollout_col}, {archived_col} FROM threads"
+        );
         let mut stmt = conn
             .prepare(&query)
             .map_err(|e| CodexxError::Database(e.to_string()))?;
@@ -1020,18 +1084,25 @@ pub(super) fn scan_sqlite_with_paths(
                     row.get::<_, Option<String>>(1)?,
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             })
             .map_err(|e| CodexxError::Database(e.to_string()))?;
         for row in rows {
-            let (id, provider, cwd, rollout_path) =
+            let (id, provider, cwd, rollout_path, archived) =
                 row.map_err(|e| CodexxError::Database(e.to_string()))?;
             thread_ids.insert(id.clone());
-            if let Some(rollout_path) = rollout_path
-                .map(|path| path.trim().to_string())
-                .filter(|path| !path.is_empty())
-            {
-                rollout_paths_by_thread_id.insert(id.clone(), rollout_path);
+            let archived = archived != 0;
+            if archived {
+                archived_thread_ids.insert(id.clone());
+            } else {
+                syncable_thread_ids.insert(id.clone());
+                if let Some(rollout_path) = rollout_path
+                    .map(|path| path.trim().to_string())
+                    .filter(|path| !path.is_empty())
+                {
+                    rollout_paths_by_thread_id.insert(id.clone(), rollout_path);
+                }
             }
             if sqlite_thread_needs_alignment(
                 rollouts,
@@ -1041,6 +1112,7 @@ pub(super) fn scan_sqlite_with_paths(
                     provider: provider.as_deref(),
                     cwd: cwd.as_deref(),
                     cwd_column: cols.contains("cwd"),
+                    archived,
                 },
             ) {
                 mismatched_ids.insert(id);
@@ -1053,7 +1125,8 @@ pub(super) fn scan_sqlite_with_paths(
     scan.subagent_threads = subagent_ids.len();
     scan.top_level_threads = thread_ids.len().saturating_sub(subagent_ids.len());
     scan.mismatched_threads = mismatched_ids.len();
-    scan.thread_ids = thread_ids;
+    scan.syncable_thread_ids = syncable_thread_ids;
+    scan.archived_thread_ids = archived_thread_ids;
     scan.rollout_paths_by_thread_id = rollout_paths_by_thread_id;
     scan.mismatched_thread_ids = mismatched_ids;
     Ok(scan)
@@ -1160,17 +1233,20 @@ pub(super) fn list_session_previews_with_paths(
                     .as_ref()
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty());
-                let needs_sync = rollouts.mismatched_thread_ids.contains(&id)
-                    || sqlite_thread_needs_alignment(
-                        rollouts,
-                        target_provider,
-                        &SqliteThreadIndexState {
-                            thread_id: &id,
-                            provider: normalized_provider.as_deref(),
-                            cwd: normalized_cwd.as_deref(),
-                            cwd_column: cols.contains("cwd"),
-                        },
-                    );
+                let is_archived = archived != 0;
+                let needs_sync = !is_archived
+                    && (rollouts.mismatched_thread_ids.contains(&id)
+                        || sqlite_thread_needs_alignment(
+                            rollouts,
+                            target_provider,
+                            &SqliteThreadIndexState {
+                                thread_id: &id,
+                                provider: normalized_provider.as_deref(),
+                                cwd: normalized_cwd.as_deref(),
+                                cwd_column: cols.contains("cwd"),
+                                archived: is_archived,
+                            },
+                        ));
                 let is_subagent = subagent_thread_ids.contains(&id);
                 Ok(SessionPreview {
                     id,
@@ -1183,7 +1259,7 @@ pub(super) fn list_session_previews_with_paths(
                     cwd: normalized_cwd,
                     rollout_path: normalized_rollout_path,
                     updated_at_ms: updated_at_ms.or_else(|| updated_at.map(|v| v * 1000)),
-                    archived: archived != 0,
+                    archived: is_archived,
                     has_user_event: has_user_event != 0,
                     is_subagent,
                     needs_sync,

@@ -2,7 +2,7 @@ use super::backup::{create_provider_sync_backup, prune_provider_sync_backups};
 use super::catalog::{scan_catalog_sync, CatalogSyncScan};
 use super::storage::{
     current_model_provider, discover_sqlite_databases, ensure_sqlite_discovery_writable,
-    list_session_previews_with_paths, scan_rollouts, scan_rollouts_for_thread_ids,
+    list_session_previews_with_paths, scan_provider_rollouts, scan_rollouts_for_thread_ids,
     scan_sqlite_with_paths, SqliteDiscovery,
 };
 use super::transaction::{
@@ -35,7 +35,7 @@ fn scan_provider_buckets(
     let mut rollouts = scan_rollouts_for_thread_ids(
         codex_dir,
         target_provider,
-        &sqlite.thread_ids,
+        &sqlite.syncable_thread_ids,
         &sqlite.rollout_paths_by_thread_id,
     )?;
     // Provider synchronization must not repair or rewrite the independent cwd index.
@@ -75,6 +75,7 @@ struct ProviderSyncScan {
     sqlite: SqliteScan,
     rollouts: RolloutScan,
     catalog: CatalogSyncScan,
+    syncable_thread_ids: HashSet<String>,
     scan_failures: Vec<String>,
     warnings: Vec<String>,
 }
@@ -89,24 +90,40 @@ fn scan_provider_sync_data(
         &RolloutScan::default(),
         target_provider,
     )?;
-    let sqlite = scan_sqlite_with_paths(
+    let mut sqlite = scan_sqlite_with_paths(
         &discovery.thread_paths,
         &RolloutScan::default(),
         target_provider,
     )?;
+    let mut syncable_thread_ids = sqlite.syncable_thread_ids.clone();
+    let mut archived_thread_ids = sqlite.archived_thread_ids.clone();
+    if active_sqlite.sqlite_dbs > 0 {
+        syncable_thread_ids.retain(|id| !active_sqlite.archived_thread_ids.contains(id));
+        archived_thread_ids.retain(|id| !active_sqlite.syncable_thread_ids.contains(id));
+    }
+    // Without an authoritative active database, conflicting legacy rows are unsafe to mutate.
+    syncable_thread_ids.retain(|id| !archived_thread_ids.contains(id));
+    sqlite
+        .mismatched_thread_ids
+        .retain(|id| syncable_thread_ids.contains(id));
+    sqlite.mismatched_threads = sqlite.mismatched_thread_ids.len();
+
     let indexed_rollouts = if active_sqlite.sqlite_dbs > 0 {
         scan_provider_buckets(codex_dir, target_provider, &active_sqlite)?
     } else {
         scan_provider_buckets(codex_dir, target_provider, &sqlite)?
     };
     let legacy_index_warnings = scan_legacy_index_warnings(codex_dir, target_provider, discovery);
-    let mut rollouts = scan_rollouts(codex_dir, target_provider)?;
+    let mut rollouts = scan_provider_rollouts(codex_dir, target_provider, &archived_thread_ids)?;
     // Provider synchronization changes provider routing only; cwd remains independently managed.
     rollouts.cwd_by_thread_id.clear();
+    syncable_thread_ids.extend(rollouts.thread_ids.iter().cloned());
+    syncable_thread_ids.retain(|id| !archived_thread_ids.contains(id));
     let catalog = scan_catalog_sync(
         &discovery.thread_paths,
         &discovery.related_paths,
         target_provider,
+        &syncable_thread_ids,
     )?;
 
     let mut scan_failures = discovery.active_scan_failures.clone();
@@ -143,6 +160,7 @@ fn scan_provider_sync_data(
         sqlite,
         rollouts,
         catalog,
+        syncable_thread_ids,
         scan_failures,
         warnings,
     })
@@ -217,7 +235,7 @@ pub(super) fn session_sync_status_with_discovery(
     let mut mismatched_ids = sqlite_mismatch_ids.clone();
     mismatched_ids.extend(scan.rollouts.mismatched_thread_ids.iter().cloned());
     for session in &mut sessions {
-        if mismatched_ids.contains(&session.id) {
+        if !session.archived && mismatched_ids.contains(&session.id) {
             session.needs_sync = true;
         }
     }
@@ -314,13 +332,13 @@ where
     if !initial_status.scan_complete {
         return Err(scan_failure_error(&initial_status.scan_failures));
     }
-    let scan = scan_provider_sync_data(&codex_dir, &target_provider, &discovery)?;
-    if !scan.scan_failures.is_empty() {
-        return Err(scan_failure_error(&scan.scan_failures));
+    let preflight_scan = scan_provider_sync_data(&codex_dir, &target_provider, &discovery)?;
+    if !preflight_scan.scan_failures.is_empty() {
+        return Err(scan_failure_error(&preflight_scan.scan_failures));
     }
-    if scan.rollouts.changes.is_empty()
-        && scan.sqlite.mismatched_threads == 0
-        && scan.catalog.total_updates() == 0
+    if preflight_scan.rollouts.changes.is_empty()
+        && preflight_scan.sqlite.mismatched_threads == 0
+        && preflight_scan.catalog.total_updates() == 0
     {
         return Ok(SessionSyncResult {
             status: initial_status,
@@ -330,13 +348,38 @@ where
         });
     }
 
+    hook(MutationPoint::BeforeSqliteLock)?;
+    let mut pending_sqlite = prepare_sqlite_updates(&discovery.related_paths)?;
+    let scan = match scan_provider_sync_data(&codex_dir, &target_provider, &discovery) {
+        Ok(scan) => scan,
+        Err(error) => {
+            rollback_open_transactions(&mut pending_sqlite);
+            return Err(error);
+        }
+    };
+    if !scan.scan_failures.is_empty() {
+        rollback_open_transactions(&mut pending_sqlite);
+        return Err(scan_failure_error(&scan.scan_failures));
+    }
+    if scan.rollouts.changes.is_empty()
+        && scan.sqlite.mismatched_threads == 0
+        && scan.catalog.total_updates() == 0
+    {
+        rollback_open_transactions(&mut pending_sqlite);
+        let status = session_sync_status_with_discovery(&codex_dir, target_provider, &discovery)?;
+        return Ok(SessionSyncResult {
+            status,
+            updated_rollouts: 0,
+            updated_threads: 0,
+            backup_dir: String::new(),
+        });
+    }
     let changed_rollouts = scan
         .rollouts
         .changes
         .iter()
         .map(|change| change.path.clone())
         .collect::<Vec<_>>();
-    let mut pending_sqlite = prepare_sqlite_updates(&discovery.related_paths)?;
     let sqlite_snapshot_paths = pending_sqlite
         .iter()
         .map(|update| update.path().to_path_buf())
@@ -359,6 +402,7 @@ where
         &mut pending_sqlite,
         &target_provider,
         &scan.catalog.sources,
+        &scan.syncable_thread_ids,
         &mut journal,
         &mut hook,
     );
@@ -434,7 +478,8 @@ mod tests {
             "CREATE TABLE threads (
                 id TEXT PRIMARY KEY,
                 model_provider TEXT NOT NULL,
-                title TEXT
+                title TEXT,
+                archived INTEGER NOT NULL DEFAULT 0
              );",
         )
         .expect("create threads table");
@@ -455,7 +500,8 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 model_provider TEXT NOT NULL,
                 title TEXT,
-                rollout_path TEXT
+                rollout_path TEXT,
+                archived INTEGER NOT NULL DEFAULT 0
              );",
         )
         .expect("create threads table with rollout path");
@@ -544,6 +590,29 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("read thread provider")
+    }
+
+    fn thread_provider_and_archived(path: &Path, id: &str) -> (String, i64) {
+        Connection::open(path)
+            .expect("open session database")
+            .query_row(
+                "SELECT model_provider, archived FROM threads WHERE id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read thread provider and archive state")
+    }
+
+    fn catalog_provider_and_visibility(path: &Path, id: &str) -> Option<(String, i64)> {
+        Connection::open(path)
+            .expect("open catalog database")
+            .query_row(
+                "SELECT model_provider, missing_candidate FROM local_thread_catalog \
+                 WHERE thread_id = ?1",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok()
     }
 
     fn write_rollout(codex_dir: &Path, id: &str, provider: &str) -> std::path::PathBuf {
@@ -1049,6 +1118,47 @@ mod tests {
     }
 
     #[test]
+    fn conflicting_legacy_archive_state_is_not_syncable_without_active_database() {
+        let codex_dir = temp_codex_dir("legacy-archive-conflict");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let id = "019f6000-0000-7000-8000-000000000522";
+        let archived_database = codex_dir.join("sqlite/state_4.sqlite");
+        let active_database = codex_dir.join("sqlite/state_5.sqlite");
+        create_thread_database(&archived_database, id, "openai");
+        create_thread_database(&active_database, id, "openai");
+        Connection::open(&archived_database)
+            .expect("open archived legacy database")
+            .execute("UPDATE threads SET archived = 1 WHERE id = ?1", [id])
+            .expect("archive legacy thread");
+        let rollout = write_rollout(&codex_dir, id, "openai");
+        let original_rollout = fs::read(&rollout).expect("read conflicting legacy rollout");
+        let catalog = codex_dir.join("sqlite/catalog.db");
+        create_catalog_database(&catalog, &[(id, "openai")]);
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan conflicting legacy archive state");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(!status.needs_sync);
+        assert_eq!(status.mismatched_sessions, 0);
+        assert!(status.sessions.iter().all(|session| !session.needs_sync));
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("conflicting legacy state is a no-op");
+        assert_eq!(result.updated_rollouts, 0);
+        assert_eq!(result.updated_threads, 0);
+        assert!(result.backup_dir.is_empty());
+        assert_eq!(thread_provider(&archived_database, id), "openai");
+        assert_eq!(thread_provider(&active_database, id), "openai");
+        assert_eq!(catalog_provider(&catalog, id), "openai");
+        assert_eq!(
+            fs::read(rollout).expect("read preserved conflicting legacy rollout"),
+            original_rollout
+        );
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
     fn orphan_rollout_is_synchronized_like_codex_plusplus() {
         let codex_dir = temp_codex_dir("orphan-rollout");
         write_config(&codex_dir, SHARED_SESSION_PROVIDER);
@@ -1074,6 +1184,320 @@ mod tests {
         assert!(fs::read_to_string(orphan)
             .expect("read orphan rollout")
             .contains("\"model_provider\":\"custom\""));
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn active_orphan_catalog_row_is_synchronized() {
+        let codex_dir = temp_codex_dir("orphan-catalog");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let indexed_id = "019f6000-0000-7000-8000-000000000539";
+        create_thread_database(
+            &codex_dir.join("state_5.sqlite"),
+            indexed_id,
+            SHARED_SESSION_PROVIDER,
+        );
+        let orphan_id = "019f6000-0000-7000-8000-000000000540";
+        let orphan = write_rollout(&codex_dir, orphan_id, SHARED_SESSION_PROVIDER);
+        let original_rollout = fs::read(&orphan).expect("read matching orphan rollout");
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(
+            &catalog,
+            &[(indexed_id, SHARED_SESSION_PROVIDER), (orphan_id, "openai")],
+        );
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan orphan catalog mismatch");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(status.needs_sync);
+        assert_eq!(status.mismatched_rollouts, 0);
+        assert_eq!(status.mismatched_sessions, 1);
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("synchronize orphan catalog row");
+        assert_eq!(result.updated_rollouts, 0);
+        assert_eq!(result.updated_threads, 1);
+        assert!(!result.status.needs_sync);
+        assert_eq!(
+            catalog_provider(&catalog, orphan_id),
+            SHARED_SESSION_PROVIDER
+        );
+        assert_eq!(
+            fs::read(orphan).expect("read preserved matching orphan rollout"),
+            original_rollout
+        );
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn archived_thread_is_visible_but_not_a_sync_candidate() {
+        let codex_dir = temp_codex_dir("archived-not-syncable");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let id = "019f6000-0000-7000-8000-000000000533";
+        let rollout = codex_dir.join(format!(
+            "archived_sessions/2026/08/18/rollout-test-{id}.jsonl"
+        ));
+        write_rollout_at(&rollout, id, "openai");
+        let original_rollout = fs::read(&rollout).expect("read archived rollout");
+        let state = codex_dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&state, id, "openai", &rollout);
+        Connection::open(&state)
+            .expect("open archived thread database")
+            .execute("UPDATE threads SET archived = 1 WHERE id = ?1", [id])
+            .expect("archive thread");
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[(id, "openai")]);
+        Connection::open(&catalog)
+            .expect("open archived catalog")
+            .execute(
+                "UPDATE local_thread_catalog SET missing_candidate = 1 WHERE thread_id = ?1",
+                [id],
+            )
+            .expect("hide archived catalog row");
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan archived thread");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(!status.needs_sync);
+        assert_eq!(status.mismatched_threads, 0);
+        assert_eq!(status.mismatched_rollouts, 0);
+        assert_eq!(status.mismatched_sessions, 0);
+        let preview = status
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .expect("archived preview remains visible");
+        assert!(preview.archived);
+        assert!(!preview.needs_sync);
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("archived-only sync is a no-op");
+        assert_eq!(result.updated_rollouts, 0);
+        assert_eq!(result.updated_threads, 0);
+        assert!(result.backup_dir.is_empty());
+        assert_eq!(
+            thread_provider_and_archived(&state, id),
+            ("openai".to_string(), 1)
+        );
+        assert_eq!(
+            catalog_provider_and_visibility(&catalog, id),
+            Some(("openai".to_string(), 1))
+        );
+        assert_eq!(
+            fs::read(&rollout).expect("read preserved archived rollout"),
+            original_rollout
+        );
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn archive_between_scan_and_sqlite_lock_is_excluded_from_sync() {
+        let codex_dir = temp_codex_dir("archive-during-sync");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let id = "019f6000-0000-7000-8000-000000000543";
+        let rollout = write_rollout(&codex_dir, id, "openai");
+        let original_rollout = fs::read(&rollout).expect("read pre-archive rollout");
+        let state = codex_dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&state, id, "openai", &rollout);
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[(id, "openai")]);
+        let mut archive_hook_called = false;
+
+        let result = sync_sessions_provider_with_hook(
+            Some(codex_dir.display().to_string()),
+            None,
+            |point| match point {
+                MutationPoint::BeforeSqliteLock => {
+                    archive_hook_called = true;
+                    Connection::open(&state)
+                        .expect("open thread database before sync lock")
+                        .execute("UPDATE threads SET archived = 1 WHERE id = ?1", [id])
+                        .expect("archive thread before sync lock");
+                    Connection::open(&catalog)
+                        .expect("open catalog before sync lock")
+                        .execute(
+                            "UPDATE local_thread_catalog SET missing_candidate = 1 \
+                             WHERE thread_id = ?1",
+                            [id],
+                        )
+                        .expect("hide catalog row before sync lock");
+                    Ok(())
+                }
+                _ => Ok(()),
+            },
+        )
+        .expect("newly archived thread is a no-op");
+
+        assert!(archive_hook_called);
+        assert_eq!(result.updated_rollouts, 0);
+        assert_eq!(result.updated_threads, 0);
+        assert!(result.backup_dir.is_empty());
+        assert!(!result.status.needs_sync);
+        let preview = result
+            .status
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .expect("newly archived preview remains visible");
+        assert!(preview.archived);
+        assert!(!preview.needs_sync);
+        assert_eq!(
+            thread_provider_and_archived(&state, id),
+            ("openai".to_string(), 1)
+        );
+        assert_eq!(
+            catalog_provider_and_visibility(&catalog, id),
+            Some(("openai".to_string(), 1))
+        );
+        assert_eq!(
+            fs::read(rollout).expect("read preserved newly archived rollout"),
+            original_rollout
+        );
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn sync_repairs_active_thread_without_mutating_archived_storage_or_catalog() {
+        let codex_dir = temp_codex_dir("mixed-active-archived");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let active_id = "019f6000-0000-7000-8000-000000000534";
+        let hidden_archived_id = "019f6000-0000-7000-8000-000000000535";
+        let missing_archived_id = "019f6000-0000-7000-8000-000000000536";
+        let active_rollout = write_rollout(&codex_dir, active_id, "openai");
+        let hidden_archived_rollout = codex_dir.join(format!(
+            "archived_sessions/2026/08/18/rollout-test-{hidden_archived_id}.jsonl"
+        ));
+        let missing_archived_rollout = codex_dir.join(format!(
+            "archived_sessions/2026/08/18/rollout-test-{missing_archived_id}.jsonl"
+        ));
+        write_rollout_at(&hidden_archived_rollout, hidden_archived_id, "openai");
+        write_rollout_at(&missing_archived_rollout, missing_archived_id, "openai");
+        let hidden_original =
+            fs::read(&hidden_archived_rollout).expect("read hidden archived rollout");
+        let missing_original =
+            fs::read(&missing_archived_rollout).expect("read missing archived rollout");
+
+        let state = codex_dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(&state, active_id, "openai", &active_rollout);
+        let state_conn = Connection::open(&state).expect("open mixed thread database");
+        for (id, rollout) in [
+            (hidden_archived_id, &hidden_archived_rollout),
+            (missing_archived_id, &missing_archived_rollout),
+        ] {
+            state_conn
+                .execute(
+                    "INSERT INTO threads (id, model_provider, title, rollout_path, archived) \
+                     VALUES (?1, 'openai', 'archived', ?2, 1)",
+                    (id, rollout.display().to_string()),
+                )
+                .expect("insert archived thread");
+        }
+        drop(state_conn);
+
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(
+            &catalog,
+            &[(active_id, "openai"), (hidden_archived_id, "openai")],
+        );
+        Connection::open(&catalog)
+            .expect("open mixed catalog")
+            .execute(
+                "UPDATE local_thread_catalog SET missing_candidate = 1 WHERE thread_id = ?1",
+                [hidden_archived_id],
+            )
+            .expect("hide archived catalog row");
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan mixed threads");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(status.needs_sync);
+        assert_eq!(status.mismatched_sessions, 1);
+        assert!(status
+            .sessions
+            .iter()
+            .filter(|session| session.archived)
+            .all(|session| !session.needs_sync));
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("sync active thread only");
+        assert_eq!(result.updated_rollouts, 1);
+        assert!(!result.status.needs_sync);
+        assert_eq!(thread_provider(&state, active_id), SHARED_SESSION_PROVIDER);
+        assert_eq!(
+            thread_provider_and_archived(&state, hidden_archived_id),
+            ("openai".to_string(), 1)
+        );
+        assert_eq!(
+            thread_provider_and_archived(&state, missing_archived_id),
+            ("openai".to_string(), 1)
+        );
+        assert!(fs::read_to_string(&active_rollout)
+            .expect("read synchronized active rollout")
+            .contains("\"model_provider\":\"custom\""));
+        assert_eq!(
+            fs::read(&hidden_archived_rollout).expect("read preserved hidden archived rollout"),
+            hidden_original
+        );
+        assert_eq!(
+            fs::read(&missing_archived_rollout).expect("read preserved missing archived rollout"),
+            missing_original
+        );
+        assert_eq!(
+            catalog_provider(&catalog, active_id),
+            SHARED_SESSION_PROVIDER
+        );
+        assert_eq!(
+            catalog_provider_and_visibility(&catalog, hidden_archived_id),
+            Some(("openai".to_string(), 1))
+        );
+        assert_eq!(
+            catalog_provider_and_visibility(&catalog, missing_archived_id),
+            None
+        );
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn archived_orphan_rollout_is_ignored_while_active_orphan_still_syncs() {
+        let codex_dir = temp_codex_dir("orphan-storage-scope");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let indexed_id = "019f6000-0000-7000-8000-000000000537";
+        create_thread_database(
+            &codex_dir.join("state_5.sqlite"),
+            indexed_id,
+            SHARED_SESSION_PROVIDER,
+        );
+        let active_orphan_id = "019f6000-0000-7000-8000-000000000538";
+        let archived_orphan_id = "019f6000-0000-7000-8000-000000000539";
+        let active_orphan = write_rollout(&codex_dir, active_orphan_id, "openai");
+        let archived_orphan = codex_dir.join(format!(
+            "archived_sessions/2026/08/18/rollout-test-{archived_orphan_id}.jsonl"
+        ));
+        write_rollout_at(&archived_orphan, archived_orphan_id, "openai");
+        let archived_original = fs::read(&archived_orphan).expect("read archived orphan");
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan orphan storage scope");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert_eq!(status.mismatched_rollouts, 1);
+        assert_eq!(status.mismatched_sessions, 1);
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("sync active orphan only");
+        assert_eq!(result.updated_rollouts, 1);
+        assert!(!result.status.needs_sync);
+        assert!(fs::read_to_string(active_orphan)
+            .expect("read synchronized active orphan")
+            .contains("\"model_provider\":\"custom\""));
+        assert_eq!(
+            fs::read(archived_orphan).expect("read preserved archived orphan"),
+            archived_original
+        );
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");
     }
