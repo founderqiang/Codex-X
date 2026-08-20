@@ -3166,18 +3166,18 @@ fn duplicate_save_and_snapshot_commands_preserve_current_until_explicit_switch()
     let _db_guard = crate::app_db::test_db_guard();
     let codex_dir = temp_codex_dir("official-snapshot-preserves-current-duplicate");
     let custom_config = r#"model_provider = "custom"
-model = "proxy-model"
+model = "duplicate-current-model"
 
 [model_providers.custom]
-name = "Proxy"
-base_url = "https://proxy.example.com/v1"
+name = "Duplicate Current Provider"
+base_url = "https://duplicate-current.example.com/v1"
 wire_api = "responses"
 requires_openai_auth = true
 "#;
     write_text(&config_path(&codex_dir), custom_config).expect("write custom config");
     write_json(
         &auth_path(&codex_dir),
-        &json!({"OPENAI_API_KEY": "sk-proxy", "auth_mode": "apikey"}),
+        &json!({"OPENAI_API_KEY": "sk-duplicate-current", "auth_mode": "apikey"}),
     )
     .expect("write proxy auth");
 
@@ -3185,10 +3185,10 @@ requires_openai_auth = true
     let copy_id = "official-snapshot-current-copy";
     let original = SavedProvider {
         id: original_id.to_string(),
-        provider_name: "Proxy".to_string(),
-        base_url: "https://proxy.example.com/v1".to_string(),
-        model: "proxy-model".to_string(),
-        api_key: Some("sk-proxy".to_string()),
+        provider_name: "Duplicate Current Provider".to_string(),
+        base_url: "https://duplicate-current.example.com/v1".to_string(),
+        model: "duplicate-current-model".to_string(),
+        api_key: Some("sk-duplicate-current".to_string()),
         toml_config: Some(custom_config.trim_end().to_string()),
         wire_api: "responses".to_string(),
         requires_openai_auth: true,
@@ -3254,7 +3254,7 @@ requires_openai_auth = true
     let switched = save_provider_toml_config_inner(ProviderTomlInput {
         config_dir: Some(codex_dir.display().to_string()),
         config_text: custom_config.to_string(),
-        api_key: Some("sk-proxy".to_string()),
+        api_key: Some("sk-duplicate-current".to_string()),
     })
     .expect("apply the identical copied provider");
     let switched = finish_provider_selection(
