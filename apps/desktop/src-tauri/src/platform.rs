@@ -943,6 +943,9 @@ fn windows_restart_script() -> String {
         .join(", ");
     r#"
 $ErrorActionPreference = 'Stop'
+$utf8 = [System.Text.UTF8Encoding]::new($false)
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
 $identities = @(__IDENTITIES__)
 $packages = @(Get-AppxPackage |
   Where-Object { $identities -contains $_.Name } |
@@ -951,10 +954,15 @@ $packages = @(Get-AppxPackage |
 if ($packages.Count -eq 0) { throw 'Supported Codex/ChatGPT Appx package was not found.' }
 
 function Get-CodexDesktopProcesses([string]$root) {
+  $appRoot = $root + 'app\'
+  $resourcesRoot = $appRoot + 'resources\'
   @(Get-Process -ErrorAction SilentlyContinue | Where-Object {
     try {
       $processPath = [IO.Path]::GetFullPath($_.MainModule.FileName)
-      $processPath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase)
+      $executableName = [IO.Path]::GetFileName($processPath)
+      ($executableName -ieq 'Codex.exe' -or $executableName -ieq 'ChatGPT.exe') -and
+        $processPath.StartsWith($appRoot, [StringComparison]::OrdinalIgnoreCase) -and
+        -not $processPath.StartsWith($resourcesRoot, [StringComparison]::OrdinalIgnoreCase)
     } catch {
       $false
     }
@@ -990,25 +998,19 @@ if ([string]::IsNullOrWhiteSpace($applicationId) -or [string]::IsNullOrWhiteSpac
 
 $wasRunning = $processes.Count -gt 0
 if ($wasRunning) {
-  $closeRequested = $false
   foreach ($process in $processes) {
-    try {
-      if (-not $process.HasExited -and $process.MainWindowHandle -ne [IntPtr]::Zero) {
-        if ($process.CloseMainWindow()) { $closeRequested = $true }
-      }
-    } catch {}
-  }
-  if (-not $closeRequested) {
-    throw 'Codex/ChatGPT is running but its main window could not be asked to close normally.'
+    Stop-Process -InputObject $process -Force -ErrorAction SilentlyContinue
   }
 
   $quitDeadline = [DateTime]::UtcNow.AddSeconds(8)
   do {
-    Start-Sleep -Milliseconds 100
     $remaining = @(Get-CodexDesktopProcesses $installRoot)
-  } while ($remaining.Count -gt 0 -and [DateTime]::UtcNow -lt $quitDeadline)
+    if ($remaining.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $quitDeadline)
+  $remaining = @(Get-CodexDesktopProcesses $installRoot)
   if ($remaining.Count -gt 0) {
-    throw 'Codex/ChatGPT did not exit normally before the timeout; relaunch was cancelled.'
+    throw 'Codex/ChatGPT background processes could not be stopped before the timeout; relaunch was cancelled.'
   }
 }
 
@@ -1407,13 +1409,20 @@ mod tests {
     }
 
     #[test]
-    fn windows_restart_script_only_targets_selected_package_directory() {
+    fn windows_restart_script_only_stops_processes_in_the_selected_package_directory() {
         let script = windows_restart_script();
-        assert!(script.contains("$processPath.StartsWith($root"));
-        assert!(script.contains("$process.CloseMainWindow()"));
+        assert!(script.contains("$processPath.StartsWith($appRoot"));
+        assert!(script.contains("$executableName -ieq 'Codex.exe'"));
+        assert!(script.contains("$executableName -ieq 'ChatGPT.exe'"));
+        assert!(script.contains("-not $processPath.StartsWith($resourcesRoot"));
+        assert!(script.contains("Stop-Process -InputObject $process -Force"));
+        assert!(script.contains("[Console]::OutputEncoding = $utf8"));
         assert!(script.contains("shell:AppsFolder\\"));
-        assert!(!script.contains("Stop-Process"));
+        assert!(!script.contains("CloseMainWindow"));
+        assert!(!script.contains("Get-Process -Name"));
+        assert!(!script.contains("Stop-Process -Name"));
         assert!(!script.contains("taskkill"));
+        assert!(!script.contains("ApplicationFrameHost"));
     }
 
     #[test]

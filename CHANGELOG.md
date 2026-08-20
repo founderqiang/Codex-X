@@ -4,6 +4,12 @@ All notable changes to Codex-X will be documented here.
 
 ## [Unreleased]
 
+## [v0.3.15] - 2026-08-20
+
+### 修复 Bug
+
+- 修复 Windows 重启 Codex 时仅隐藏到托盘、后台未退出，以及再次重启报错的问题。
+
 ## [v0.3.14] - 2026-08-20
 
 ### 更新
