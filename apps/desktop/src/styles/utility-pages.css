@@ -232,6 +232,18 @@
   line-height: 1.3;
 }
 
+.cx-page-restart-target {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--cx-page-text);
+}
+
+.cx-page-restart-target > svg {
+  flex: 0 0 auto;
+  color: var(--cx-page-blue);
+}
+
 .cx-page-setting-copy p {
   margin: 5px 0 0;
   color: var(--cx-page-muted);

@@ -194,13 +194,13 @@ fn is_locked_io_error(error: &std::io::Error) -> bool {
 }
 
 pub(crate) fn scan_rollouts(codex_dir: &Path, target_provider: &str) -> Result<RolloutScan> {
-    scan_rollouts_with_thread_filter(codex_dir, target_provider, None, None, true, None)
+    scan_rollouts_with_thread_filter(codex_dir, target_provider, None, None, true, None, false)
 }
 
 pub(super) fn scan_provider_rollouts(
     codex_dir: &Path,
     target_provider: &str,
-    archived_thread_ids: &HashSet<String>,
+    excluded_thread_ids: &HashSet<String>,
 ) -> Result<RolloutScan> {
     scan_rollouts_with_thread_filter(
         codex_dir,
@@ -208,7 +208,8 @@ pub(super) fn scan_provider_rollouts(
         None,
         None,
         false,
-        Some(archived_thread_ids),
+        Some(excluded_thread_ids),
+        true,
     )
 }
 
@@ -225,6 +226,7 @@ pub(super) fn scan_rollouts_for_thread_ids(
         Some(rollout_paths_by_thread_id),
         false,
         None,
+        false,
     )
 }
 
@@ -235,6 +237,7 @@ fn scan_rollouts_with_thread_filter(
     rollout_paths_by_thread_id: Option<&HashMap<String, String>>,
     include_archived_storage: bool,
     excluded_thread_ids: Option<&HashSet<String>>,
+    exclude_source_marked_subagents: bool,
 ) -> Result<RolloutScan> {
     let mut paths = Vec::new();
     let mut scan = RolloutScan::default();
@@ -313,6 +316,7 @@ fn scan_rollouts_with_thread_filter(
         let mut invalid_session_meta = 0usize;
         let mut thread_id = None;
         let mut cwd = None;
+        let mut is_subagent = false;
 
         for segment in text.split_inclusive('\n') {
             let (line, line_ending) = split_line_ending(segment);
@@ -335,6 +339,9 @@ fn scan_rollouts_with_thread_filter(
                                     .get("cwd")
                                     .and_then(Value::as_str)
                                     .and_then(normalize_workspace_path);
+                            }
+                            if payload.get("source").is_some_and(source_value_is_subagent) {
+                                is_subagent = true;
                             }
                             if payload.get("model_provider").and_then(Value::as_str)
                                 != Some(target_provider)
@@ -360,9 +367,10 @@ fn scan_rollouts_with_thread_filter(
             next_text.push_str(line_ending);
         }
 
-        if thread_id
-            .as_ref()
-            .is_some_and(|id| excluded_thread_ids.is_some_and(|excluded| excluded.contains(id)))
+        if (exclude_source_marked_subagents && is_subagent)
+            || thread_id
+                .as_ref()
+                .is_some_and(|id| excluded_thread_ids.is_some_and(|excluded| excluded.contains(id)))
         {
             continue;
         }
@@ -971,15 +979,7 @@ pub(super) fn sqlite_subagent_thread_ids(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
             {
-                let source_is_subagent = source.eq_ignore_ascii_case("subagent")
-                    || serde_json::from_str::<Value>(source)
-                        .ok()
-                        .is_some_and(|value| {
-                            value
-                                .as_object()
-                                .is_some_and(|object| object.contains_key("subagent"))
-                        });
-                if source_is_subagent {
+                if source_text_is_subagent(source) {
                     ids.insert(id);
                 } else {
                     ids.remove(&id);
@@ -989,6 +989,23 @@ pub(super) fn sqlite_subagent_thread_ids(
     }
 
     Ok(ids)
+}
+
+fn source_value_is_subagent(source: &Value) -> bool {
+    match source {
+        Value::String(source) => source.trim().eq_ignore_ascii_case("subagent"),
+        Value::Object(source) => source.contains_key("subagent"),
+        _ => false,
+    }
+}
+
+fn source_text_is_subagent(source: &str) -> bool {
+    let source = source.trim();
+    source.eq_ignore_ascii_case("subagent")
+        || serde_json::from_str::<Value>(source)
+            .ok()
+            .as_ref()
+            .is_some_and(source_value_is_subagent)
 }
 
 pub(super) struct SqliteThreadIndexState<'a> {
@@ -1121,12 +1138,17 @@ pub(super) fn scan_sqlite_with_paths(
         subagent_ids.extend(sqlite_subagent_thread_ids(&conn, &cols)?);
     }
     subagent_ids.retain(|id| thread_ids.contains(id));
+    syncable_thread_ids.retain(|id| !subagent_ids.contains(id));
+    rollout_paths_by_thread_id.retain(|id, _| !subagent_ids.contains(id));
+    mismatched_ids.retain(|id| !subagent_ids.contains(id));
     scan.sqlite_threads = thread_ids.len();
     scan.subagent_threads = subagent_ids.len();
     scan.top_level_threads = thread_ids.len().saturating_sub(subagent_ids.len());
     scan.mismatched_threads = mismatched_ids.len();
+    scan.thread_ids = thread_ids;
     scan.syncable_thread_ids = syncable_thread_ids;
     scan.archived_thread_ids = archived_thread_ids;
+    scan.subagent_thread_ids = subagent_ids;
     scan.rollout_paths_by_thread_id = rollout_paths_by_thread_id;
     scan.mismatched_thread_ids = mismatched_ids;
     Ok(scan)
@@ -1234,7 +1256,9 @@ pub(super) fn list_session_previews_with_paths(
                     .map(|v| v.trim().to_string())
                     .filter(|v| !v.is_empty());
                 let is_archived = archived != 0;
+                let is_subagent = subagent_thread_ids.contains(&id);
                 let needs_sync = !is_archived
+                    && !is_subagent
                     && (rollouts.mismatched_thread_ids.contains(&id)
                         || sqlite_thread_needs_alignment(
                             rollouts,
@@ -1247,7 +1271,6 @@ pub(super) fn list_session_previews_with_paths(
                                 archived: is_archived,
                             },
                         ));
-                let is_subagent = subagent_thread_ids.contains(&id);
                 Ok(SessionPreview {
                     id,
                     title: clean_title,

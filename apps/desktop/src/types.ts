@@ -137,6 +137,11 @@ export type AboutInfo = {
   nativeUpdaterSupported: boolean;
 };
 
+export type CodexDesktopRestartResult = {
+  appName: string;
+  wasRunning: boolean;
+};
+
 export type ReleaseInfo = {
   status: "idle" | "checking" | "ok" | "error";
   latestVersion?: string;
@@ -191,6 +196,7 @@ export type ManagedSkill = {
   id: string;
   name: string;
   description?: string | null;
+  note?: string | null;
   directory: string;
   enabled: boolean;
   source: string;
@@ -206,6 +212,7 @@ export type ManagedMcpServer = {
   enabled: boolean;
   source: string;
   summary: string;
+  note?: string | null;
   command?: string | null;
   url?: string | null;
   configJson: unknown;

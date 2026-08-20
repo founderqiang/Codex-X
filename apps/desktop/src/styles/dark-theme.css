@@ -438,6 +438,10 @@
   border-color: transparent;
 }
 
+:root[data-theme="dark"] .cx-providers-row-meta {
+  color: #aeb3bc;
+}
+
 :root[data-theme="dark"] .cx-providers-info-grid code {
   color: var(--cx-dark-muted);
   background: transparent;
@@ -768,6 +772,20 @@
   background: var(--cx-dark-surface-hover);
   border-color: var(--cx-dark-border-strong);
   box-shadow: 0 7px 18px rgba(0, 0, 0, 0.18);
+}
+
+:root[data-theme="dark"] .cx-skills-note-field > span {
+  color: #d8dbe0;
+}
+
+:root[data-theme="dark"] .cx-skills-note-field textarea {
+  color: #e5e7eb;
+  background: var(--cx-dark-surface-recessed);
+  border-color: var(--cx-dark-border);
+}
+
+:root[data-theme="dark"] .cx-skills-note-meta {
+  color: var(--cx-dark-subtle);
 }
 
 :root[data-theme="dark"] .cx-prompts-row:hover {

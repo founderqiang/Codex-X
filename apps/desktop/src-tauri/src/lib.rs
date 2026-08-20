@@ -82,14 +82,16 @@ use providers::{
     upsert_provider_on_connection, CcSwitchCodexRow, ProviderUpsertKind, ProviderUpsertMode,
 };
 use providers::{
-    build_provider_toml_draft_inner, delete_saved_provider_inner, fetch_provider_models_inner,
-    get_official_config_draft_inner, import_ccswitch_codex_providers_inner,
-    list_saved_providers_inner, read_ccswitch_official_auth_inner, reset_official_provider_inner,
-    restore_official_provider_inner, save_active_provider_inner, save_official_config_inner,
-    save_provider_inner, save_provider_toml_config_inner, switch_official_provider_inner,
-    switch_provider_inner, test_provider_connection_inner, ImportResult, OfficialAuthCandidate,
-    OfficialConfigDraft, OfficialConfigInput, ProviderConnectionResult, ProviderInput,
-    ProviderModelsResult, ProviderTomlInput, SavedProvider,
+    build_provider_toml_draft_inner, clear_active_provider_on_connection,
+    delete_saved_provider_inner, fetch_provider_models_inner, get_official_config_draft_inner,
+    import_ccswitch_codex_providers_inner, list_saved_providers_inner, open_store,
+    read_ccswitch_official_auth_inner, remember_active_provider_on_connection,
+    reset_official_provider_inner, restore_official_provider_inner, save_active_provider_inner,
+    save_official_config_inner, save_provider_inner, save_provider_toml_config_inner,
+    switch_official_provider_inner, switch_provider_inner, test_provider_connection_inner,
+    ImportResult, OfficialAuthCandidate, OfficialConfigDraft, OfficialConfigInput,
+    ProviderConnectionResult, ProviderInput, ProviderModelsResult, ProviderTomlInput,
+    SavedProvider,
 };
 #[cfg(test)]
 use sessions::{
@@ -105,8 +107,9 @@ use sessions::{
 };
 use skills_mcp::{
     build_skills_mcp_state_inner, check_skill_updates_inner, import_existing_skills_mcp_inner,
-    install_skill_zip_inner, preview_existing_skills_mcp_inner, toggle_codex_mcp_inner,
-    toggle_codex_skill_inner, SkillsMcpActionResult, SkillsMcpImportPreview, SkillsMcpState,
+    install_skill_zip_inner, preview_existing_skills_mcp_inner, save_skills_mcp_note_inner,
+    toggle_codex_mcp_inner, toggle_codex_skill_inner, SkillsMcpActionResult,
+    SkillsMcpImportPreview, SkillsMcpState,
 };
 #[cfg(test)]
 use skills_mcp::{
@@ -152,6 +155,13 @@ struct AboutInfo {
     project_url: String,
     github_repo: String,
     native_updater_supported: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CodexDesktopRestartResult {
+    app_name: String,
+    was_running: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -474,6 +484,20 @@ async fn toggle_codex_mcp(
 }
 
 #[tauri::command]
+async fn save_skills_mcp_note(
+    config_dir: Option<String>,
+    item_kind: String,
+    id: String,
+    note: String,
+) -> Result<SkillsMcpState> {
+    tauri::async_runtime::spawn_blocking(move || {
+        save_skills_mcp_note_inner(config_dir, item_kind, id, note)
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("保存 Skills/MCP 备注失败: {e}")))?
+}
+
+#[tauri::command]
 async fn install_skill_zip(
     config_dir: Option<String>,
     file_name: String,
@@ -576,6 +600,18 @@ async fn get_about_info(config_dir: Option<String>) -> Result<AboutInfo> {
     tauri::async_runtime::spawn_blocking(move || get_about_info_inner(config_dir))
         .await
         .map_err(|e| CodexxError::Config(format!("读取关于信息失败: {e}")))?
+}
+
+#[tauri::command]
+async fn restart_codex_desktop() -> std::result::Result<CodexDesktopRestartResult, String> {
+    let (app_name, was_running) =
+        tauri::async_runtime::spawn_blocking(platform::restart_codex_desktop)
+            .await
+            .map_err(|error| format!("重启 Codex 桌面客户端失败: {error}"))??;
+    Ok(CodexDesktopRestartResult {
+        app_name,
+        was_running,
+    })
 }
 
 #[tauri::command]
@@ -852,6 +888,54 @@ async fn list_saved_providers() -> Result<Vec<SavedProvider>> {
         .map_err(|e| CodexxError::Config(format!("读取供应商列表失败: {e}")))?
 }
 
+enum ActiveProviderSelectionUpdate {
+    Set(String),
+    ClearIfOfficial,
+}
+
+fn finish_provider_selection(
+    mut result: ActionResult,
+    update: ActiveProviderSelectionUpdate,
+) -> ActionResult {
+    if matches!(update, ActiveProviderSelectionUpdate::ClearIfOfficial)
+        && !result.state.is_official_provider
+    {
+        return result;
+    }
+    match &update {
+        ActiveProviderSelectionUpdate::Set(provider_id) => {
+            result.state.active_saved_provider_id = Some(provider_id.clone());
+        }
+        ActiveProviderSelectionUpdate::ClearIfOfficial => {
+            result.state.active_saved_provider_id = None;
+        }
+    }
+
+    let codex_dir = PathBuf::from(&result.state.codex_dir);
+    let refreshed_state = (|| -> Result<CodexState> {
+        let conn = open_store()?;
+        match update {
+            ActiveProviderSelectionUpdate::Set(provider_id) => {
+                remember_active_provider_on_connection(&conn, &codex_dir, &provider_id)?;
+            }
+            ActiveProviderSelectionUpdate::ClearIfOfficial => {
+                clear_active_provider_on_connection(&conn, &codex_dir)?;
+            }
+        }
+        drop(conn);
+        build_state_after_migration(codex_dir)
+    })();
+    match refreshed_state {
+        Ok(state) => result.state = state,
+        Err(error) => {
+            result
+                .message
+                .push_str(&format!("；当前供应商状态记录失败：{error}"));
+        }
+    }
+    result
+}
+
 #[tauri::command]
 async fn build_provider_toml_draft(
     provider: SavedProvider,
@@ -880,9 +964,16 @@ async fn save_active_provider(
     provider: SavedProvider,
     config_dir: Option<String>,
 ) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || save_active_provider_inner(provider, config_dir))
-        .await
-        .map_err(|e| CodexxError::Config(format!("保存活动供应商失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let provider_id = provider.id.clone();
+        let result = save_active_provider_inner(provider, config_dir)?;
+        Ok(finish_provider_selection(
+            result,
+            ActiveProviderSelectionUpdate::Set(provider_id),
+        ))
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("保存活动供应商失败: {e}")))?
 }
 
 #[tauri::command]
@@ -906,9 +997,15 @@ fn get_codex_state_inner(config_dir: Option<String>) -> Result<CodexState> {
 
 #[tauri::command]
 async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || switch_official_provider_inner(config_dir))
-        .await
-        .map_err(|e| CodexxError::Config(format!("切换官方配置失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = switch_official_provider_inner(config_dir)?;
+        Ok(finish_provider_selection(
+            result,
+            ActiveProviderSelectionUpdate::ClearIfOfficial,
+        ))
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("切换官方配置失败: {e}")))?
 }
 
 #[tauri::command]
@@ -922,15 +1019,26 @@ async fn get_official_config_draft(
 
 #[tauri::command]
 async fn restore_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || restore_official_provider_inner(config_dir))
-        .await
-        .map_err(|e| CodexxError::Config(format!("还原官方配置失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = restore_official_provider_inner(config_dir)?;
+        Ok(finish_provider_selection(
+            result,
+            ActiveProviderSelectionUpdate::ClearIfOfficial,
+        ))
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("还原官方配置失败: {e}")))?
 }
 
 #[tauri::command]
 async fn reset_official_provider(input: OfficialConfigInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        reset_official_provider_inner(input.config_dir, input.model, input.config_text)
+        let result =
+            reset_official_provider_inner(input.config_dir, input.model, input.config_text)?;
+        Ok(finish_provider_selection(
+            result,
+            ActiveProviderSelectionUpdate::ClearIfOfficial,
+        ))
     })
     .await
     .map_err(|e| CodexxError::Config(format!("新建官方配置失败: {e}")))?
@@ -939,12 +1047,16 @@ async fn reset_official_provider(input: OfficialConfigInput) -> Result<ActionRes
 #[tauri::command]
 async fn save_official_config(input: OfficialConfigInput) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
-        save_official_config_inner(
+        let result = save_official_config_inner(
             input.config_dir,
             input.model,
             input.auth_json,
             input.config_text,
-        )
+        )?;
+        Ok(finish_provider_selection(
+            result,
+            ActiveProviderSelectionUpdate::ClearIfOfficial,
+        ))
     })
     .await
     .map_err(|e| CodexxError::Config(format!("保存官方配置失败: {e}")))?
@@ -1124,10 +1236,21 @@ async fn disable_external_instruction(config_dir: Option<String>) -> Result<Acti
 }
 
 #[tauri::command]
-async fn save_provider_toml_config(input: ProviderTomlInput) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || save_provider_toml_config_inner(input))
-        .await
-        .map_err(|e| CodexxError::Config(format!("保存供应商 TOML 失败: {e}")))?
+async fn save_provider_toml_config(
+    input: ProviderTomlInput,
+    provider_id: Option<String>,
+) -> Result<ActionResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = save_provider_toml_config_inner(input)?;
+        Ok(match provider_id {
+            Some(provider_id) => {
+                finish_provider_selection(result, ActiveProviderSelectionUpdate::Set(provider_id))
+            }
+            None => result,
+        })
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("保存供应商 TOML 失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1152,9 +1275,18 @@ async fn fetch_provider_models(
 
 #[tauri::command]
 async fn switch_provider(input: ProviderInput) -> Result<ActionResult> {
-    tauri::async_runtime::spawn_blocking(move || switch_provider_inner(input))
-        .await
-        .map_err(|e| CodexxError::Config(format!("切换供应商失败: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let provider_id = input.provider_id.clone();
+        let result = switch_provider_inner(input)?;
+        Ok(match provider_id {
+            Some(provider_id) => {
+                finish_provider_selection(result, ActiveProviderSelectionUpdate::Set(provider_id))
+            }
+            None => result,
+        })
+    })
+    .await
+    .map_err(|e| CodexxError::Config(format!("切换供应商失败: {e}")))?
 }
 
 #[tauri::command]
@@ -1341,12 +1473,14 @@ pub fn run() {
         .on_window_event(desktop_lifecycle::handle_window_event)
         .invoke_handler(tauri::generate_handler![
             get_about_info,
+            restart_codex_desktop,
             check_app_update,
             get_skills_mcp_state,
             preview_existing_skills_mcp,
             import_existing_skills_mcp,
             toggle_codex_skill,
             toggle_codex_mcp,
+            save_skills_mcp_note,
             install_skill_zip,
             check_skill_updates,
             get_startup_diagnostics,

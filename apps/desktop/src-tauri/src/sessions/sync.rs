@@ -97,15 +97,27 @@ fn scan_provider_sync_data(
     )?;
     let mut syncable_thread_ids = sqlite.syncable_thread_ids.clone();
     let mut archived_thread_ids = sqlite.archived_thread_ids.clone();
+    let mut subagent_thread_ids = sqlite.subagent_thread_ids.clone();
+    let mut mismatched_thread_ids = sqlite.mismatched_thread_ids.clone();
     if active_sqlite.sqlite_dbs > 0 {
-        syncable_thread_ids.retain(|id| !active_sqlite.archived_thread_ids.contains(id));
-        archived_thread_ids.retain(|id| !active_sqlite.syncable_thread_ids.contains(id));
+        syncable_thread_ids.retain(|id| !active_sqlite.thread_ids.contains(id));
+        archived_thread_ids.retain(|id| !active_sqlite.thread_ids.contains(id));
+        subagent_thread_ids.retain(|id| !active_sqlite.thread_ids.contains(id));
+        mismatched_thread_ids.retain(|id| !active_sqlite.thread_ids.contains(id));
+        syncable_thread_ids.extend(active_sqlite.syncable_thread_ids.iter().cloned());
+        archived_thread_ids.extend(active_sqlite.archived_thread_ids.iter().cloned());
+        subagent_thread_ids.extend(active_sqlite.subagent_thread_ids.iter().cloned());
+        mismatched_thread_ids.extend(active_sqlite.mismatched_thread_ids.iter().cloned());
     }
-    // Without an authoritative active database, conflicting legacy rows are unsafe to mutate.
-    syncable_thread_ids.retain(|id| !archived_thread_ids.contains(id));
-    sqlite
-        .mismatched_thread_ids
-        .retain(|id| syncable_thread_ids.contains(id));
+    let mut excluded_thread_ids = archived_thread_ids.clone();
+    excluded_thread_ids.extend(subagent_thread_ids.iter().cloned());
+    // Without an active authority, conflicting legacy classifications stay conservatively excluded.
+    syncable_thread_ids.retain(|id| !excluded_thread_ids.contains(id));
+    mismatched_thread_ids.retain(|id| syncable_thread_ids.contains(id));
+    sqlite.syncable_thread_ids = syncable_thread_ids.clone();
+    sqlite.archived_thread_ids = archived_thread_ids;
+    sqlite.subagent_thread_ids = subagent_thread_ids;
+    sqlite.mismatched_thread_ids = mismatched_thread_ids;
     sqlite.mismatched_threads = sqlite.mismatched_thread_ids.len();
 
     let indexed_rollouts = if active_sqlite.sqlite_dbs > 0 {
@@ -114,11 +126,11 @@ fn scan_provider_sync_data(
         scan_provider_buckets(codex_dir, target_provider, &sqlite)?
     };
     let legacy_index_warnings = scan_legacy_index_warnings(codex_dir, target_provider, discovery);
-    let mut rollouts = scan_provider_rollouts(codex_dir, target_provider, &archived_thread_ids)?;
+    let mut rollouts = scan_provider_rollouts(codex_dir, target_provider, &excluded_thread_ids)?;
     // Provider synchronization changes provider routing only; cwd remains independently managed.
     rollouts.cwd_by_thread_id.clear();
     syncable_thread_ids.extend(rollouts.thread_ids.iter().cloned());
-    syncable_thread_ids.retain(|id| !archived_thread_ids.contains(id));
+    syncable_thread_ids.retain(|id| !excluded_thread_ids.contains(id));
     let catalog = scan_catalog_sync(
         &discovery.thread_paths,
         &discovery.related_paths,
@@ -235,7 +247,7 @@ pub(super) fn session_sync_status_with_discovery(
     let mut mismatched_ids = sqlite_mismatch_ids.clone();
     mismatched_ids.extend(scan.rollouts.mismatched_thread_ids.iter().cloned());
     for session in &mut sessions {
-        if !session.archived && mismatched_ids.contains(&session.id) {
+        if !session.archived && !session.is_subagent && mismatched_ids.contains(&session.id) {
             session.needs_sync = true;
         }
     }
@@ -630,6 +642,34 @@ mod tests {
             ),
         )
         .expect("write rollout");
+    }
+
+    fn write_subagent_rollout(
+        codex_dir: &Path,
+        id: &str,
+        parent_id: &str,
+        provider: &str,
+    ) -> std::path::PathBuf {
+        let path = codex_dir.join(format!("sessions/rollout-test-{id}.jsonl"));
+        fs::create_dir_all(path.parent().expect("rollout parent")).expect("create rollout parent");
+        let record = serde_json::json!({
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "model_provider": provider,
+                "source": {
+                    "subagent": {
+                        "thread_spawn": {
+                            "parent_thread_id": parent_id,
+                            "depth": 1,
+                            "agent_path": "/root/test-agent"
+                        }
+                    }
+                }
+            }
+        });
+        fs::write(&path, format!("{record}\n")).expect("write subagent rollout");
+        path
     }
 
     #[test]
@@ -1033,6 +1073,68 @@ mod tests {
     }
 
     #[test]
+    fn active_user_thread_overrides_stale_legacy_subagent_marker() {
+        let codex_dir = temp_codex_dir("active-user-legacy-subagent");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let id = "019f6000-0000-7000-8000-000000000575";
+        let active = codex_dir.join("state_5.sqlite");
+        let legacy = codex_dir.join("sqlite/state_5.sqlite");
+        for database in [&active, &legacy] {
+            create_thread_database(database, id, "openai");
+            Connection::open(database)
+                .expect("open thread classification database")
+                .execute_batch("ALTER TABLE threads ADD COLUMN thread_source TEXT;")
+                .expect("add thread source column");
+        }
+        Connection::open(&active)
+            .expect("open active user database")
+            .execute(
+                "UPDATE threads SET thread_source = 'user' WHERE id = ?1",
+                [id],
+            )
+            .expect("mark active thread as user");
+        Connection::open(&legacy)
+            .expect("open legacy subagent database")
+            .execute(
+                "UPDATE threads SET thread_source = 'subagent' WHERE id = ?1",
+                [id],
+            )
+            .expect("mark legacy thread as subagent");
+        let rollout = write_rollout(&codex_dir, id, "openai");
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(&catalog, &[(id, "openai")]);
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan active user with stale legacy subagent marker");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(status.needs_sync);
+        assert_eq!(status.subagent_threads, 0);
+        assert_eq!(status.mismatched_threads, 1);
+        assert_eq!(status.mismatched_sessions, 1);
+        let preview = status
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .expect("active user preview");
+        assert!(!preview.is_subagent);
+        assert!(preview.needs_sync);
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("synchronize authoritative active user thread");
+        assert!(!result.status.needs_sync);
+        assert_eq!(result.updated_rollouts, 1);
+        assert!(result.updated_threads > 0);
+        assert_eq!(thread_provider(&active, id), SHARED_SESSION_PROVIDER);
+        assert_eq!(thread_provider(&legacy, id), SHARED_SESSION_PROVIDER);
+        assert_eq!(catalog_provider(&catalog, id), SHARED_SESSION_PROVIDER);
+        assert!(fs::read_to_string(rollout)
+            .expect("read synchronized active user rollout")
+            .contains("\"model_provider\":\"custom\""));
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
     fn stale_legacy_rollout_reference_warns_without_blocking_active_sync() {
         let codex_dir = temp_codex_dir("stale-legacy-rollout");
         write_config(&codex_dir, SHARED_SESSION_PROVIDER);
@@ -1288,6 +1390,171 @@ mod tests {
         assert_eq!(
             fs::read(&rollout).expect("read preserved archived rollout"),
             original_rollout
+        );
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn subagents_are_visible_but_excluded_from_provider_sync() {
+        let codex_dir = temp_codex_dir("subagents-not-syncable");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let parent_id = "019f6000-0000-7000-8000-000000000570";
+        let edge_child_id = "019f6000-0000-7000-8000-000000000571";
+        let source_child_id = "019f6000-0000-7000-8000-000000000572";
+        let parent_rollout = write_rollout(&codex_dir, parent_id, SHARED_SESSION_PROVIDER);
+        let edge_child_rollout =
+            write_subagent_rollout(&codex_dir, edge_child_id, parent_id, "openai");
+        let source_child_rollout =
+            write_subagent_rollout(&codex_dir, source_child_id, parent_id, "openai");
+        let edge_child_original = fs::read(&edge_child_rollout).expect("read edge child rollout");
+        let source_child_original =
+            fs::read(&source_child_rollout).expect("read source child rollout");
+
+        let state = codex_dir.join("state_5.sqlite");
+        create_thread_database_with_rollout(
+            &state,
+            parent_id,
+            SHARED_SESSION_PROVIDER,
+            &parent_rollout,
+        );
+        let state_conn = Connection::open(&state).expect("open subagent thread database");
+        state_conn
+            .execute_batch(
+                "ALTER TABLE threads ADD COLUMN thread_source TEXT;
+                 ALTER TABLE threads ADD COLUMN source TEXT;
+                 CREATE TABLE thread_spawn_edges (
+                    parent_thread_id TEXT NOT NULL,
+                    child_thread_id TEXT NOT NULL
+                 );",
+            )
+            .expect("add subagent metadata");
+        state_conn
+            .execute(
+                "INSERT INTO threads (id, model_provider, title, rollout_path)
+                 VALUES (?1, 'openai', 'edge child', ?2)",
+                (edge_child_id, edge_child_rollout.display().to_string()),
+            )
+            .expect("insert edge child thread");
+        state_conn
+            .execute(
+                "INSERT INTO thread_spawn_edges (parent_thread_id, child_thread_id)
+                 VALUES (?1, ?2)",
+                (parent_id, edge_child_id),
+            )
+            .expect("insert child spawn edge");
+        let source = serde_json::json!({
+            "subagent": {
+                "thread_spawn": {
+                    "parent_thread_id": parent_id,
+                    "depth": 1
+                }
+            }
+        })
+        .to_string();
+        state_conn
+            .execute(
+                "INSERT INTO threads (id, model_provider, title, rollout_path, source)
+                 VALUES (?1, 'openai', 'source child', ?2, ?3)",
+                (
+                    source_child_id,
+                    source_child_rollout.display().to_string(),
+                    source,
+                ),
+            )
+            .expect("insert source child thread");
+        drop(state_conn);
+
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(
+            &catalog,
+            &[
+                (parent_id, SHARED_SESSION_PROVIDER),
+                (edge_child_id, "openai"),
+                (source_child_id, "openai"),
+            ],
+        );
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan subagent threads");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(!status.needs_sync);
+        assert_eq!(status.sqlite_threads, 3);
+        assert_eq!(status.top_level_threads, 1);
+        assert_eq!(status.subagent_threads, 2);
+        assert_eq!(status.mismatched_threads, 0);
+        assert_eq!(status.mismatched_rollouts, 0);
+        assert_eq!(status.mismatched_session_meta, 0);
+        assert_eq!(status.mismatched_sessions, 0);
+        for child_id in [edge_child_id, source_child_id] {
+            let preview = status
+                .sessions
+                .iter()
+                .find(|session| session.id == child_id)
+                .expect("subagent preview remains visible");
+            assert!(preview.is_subagent);
+            assert!(!preview.needs_sync);
+        }
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("subagent-only mismatch is a no-op");
+        assert_eq!(result.updated_rollouts, 0);
+        assert_eq!(result.updated_threads, 0);
+        assert!(result.backup_dir.is_empty());
+        assert_eq!(thread_provider(&state, edge_child_id), "openai");
+        assert_eq!(thread_provider(&state, source_child_id), "openai");
+        assert_eq!(catalog_provider(&catalog, edge_child_id), "openai");
+        assert_eq!(catalog_provider(&catalog, source_child_id), "openai");
+        assert_eq!(
+            fs::read(edge_child_rollout).expect("read preserved edge child rollout"),
+            edge_child_original
+        );
+        assert_eq!(
+            fs::read(source_child_rollout).expect("read preserved source child rollout"),
+            source_child_original
+        );
+
+        fs::remove_dir_all(codex_dir).expect("remove test directory");
+    }
+
+    #[test]
+    fn rollout_only_subagent_source_is_excluded_from_provider_sync() {
+        let codex_dir = temp_codex_dir("rollout-only-subagent");
+        write_config(&codex_dir, SHARED_SESSION_PROVIDER);
+        let parent_id = "019f6000-0000-7000-8000-000000000573";
+        let child_id = "019f6000-0000-7000-8000-000000000574";
+        create_thread_database(
+            &codex_dir.join("state_5.sqlite"),
+            parent_id,
+            SHARED_SESSION_PROVIDER,
+        );
+        write_rollout(&codex_dir, parent_id, SHARED_SESSION_PROVIDER);
+        let child_rollout = write_subagent_rollout(&codex_dir, child_id, parent_id, "openai");
+        let child_original = fs::read(&child_rollout).expect("read rollout-only subagent");
+        let catalog = codex_dir.join("sqlite/codex-dev.db");
+        create_catalog_database(
+            &catalog,
+            &[(parent_id, SHARED_SESSION_PROVIDER), (child_id, "openai")],
+        );
+
+        let status = session_sync_status_inner(Some(codex_dir.display().to_string()), None)
+            .expect("scan rollout-only subagent");
+        assert!(status.scan_complete, "{:?}", status.scan_failures);
+        assert!(!status.needs_sync);
+        assert_eq!(status.mismatched_threads, 0);
+        assert_eq!(status.mismatched_rollouts, 0);
+        assert_eq!(status.mismatched_session_meta, 0);
+        assert_eq!(status.mismatched_sessions, 0);
+
+        let result = sync_sessions_provider_inner(Some(codex_dir.display().to_string()), None)
+            .expect("rollout-only subagent is a no-op");
+        assert_eq!(result.updated_rollouts, 0);
+        assert_eq!(result.updated_threads, 0);
+        assert!(result.backup_dir.is_empty());
+        assert_eq!(catalog_provider(&catalog, child_id), "openai");
+        assert_eq!(
+            fs::read(child_rollout).expect("read preserved rollout-only subagent"),
+            child_original
         );
 
         fs::remove_dir_all(codex_dir).expect("remove test directory");

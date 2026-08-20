@@ -11,7 +11,7 @@ import {
 import { OverviewPage } from "./pages/OverviewPage";
 import { AboutPage, SettingsPage, TomlConfigPage } from "./pages/UtilityPages";
 import { PromptsPage } from "./pages/PromptsPage";
-import { SkillsMcpPage } from "./pages/SkillsMcpPage";
+import { SkillsMcpPage, type SkillsMcpNoteKind } from "./pages/SkillsMcpPage";
 import { ProvidersPage, type ProviderCopy, type ProviderRow } from "./pages/ProvidersPage";
 import { AppShell, type AppTab, type AppTheme } from "./components/AppShell";
 import {
@@ -22,12 +22,15 @@ import {
 import { PageTransition } from "./components/PageTransition";
 import { cx } from "./components/ui";
 import { appUpdater, useAppUpdater } from "./appUpdater";
+import { providerProfilesMatch, type ProviderProfile } from "./providerProfiles";
+import { orderProviderRows } from "./providerRowOrder";
 import type {
   AboutInfo,
   ActionResult,
   AppUpdateInfo,
   BuiltinPromptDetail,
   BuiltinPromptStatus,
+  CodexDesktopRestartResult,
   CodexState,
   ImportResult,
   InstructionMode,
@@ -355,6 +358,7 @@ function getProviderPageCopy(lang: Lang): ProviderCopy {
     enableLabel: isChinese ? "启用" : "Enable",
     testLabel: isChinese ? "测试连接" : "Test connection",
     editLabel: t.provider.edit,
+    duplicateLabel: isChinese ? "复制供应商" : "Duplicate provider",
     removeLabel: t.provider.remove,
     deleteTitle: isChinese ? "删除供应商" : "Delete provider",
     deleteDescription: (providerName) => isChinese
@@ -481,25 +485,6 @@ function extractOpenAiApiKey(authText?: string) {
   }
 }
 
-function normalizeProviderBaseUrl(value?: string | null) {
-  const raw = (value || "").trim();
-  if (!raw) return "";
-  try {
-    const parsed = new URL(raw);
-    const credentials = parsed.username
-      ? `${parsed.username}${parsed.password ? `:${parsed.password}` : ""}@`
-      : "";
-    const path = parsed.pathname.replace(/\/+$/, "");
-    return `${parsed.protocol.toLowerCase()}//${credentials}${parsed.host.toLowerCase()}${path}${parsed.search}`;
-  } catch {
-    return raw.replace(/\/+$/, "");
-  }
-}
-
-function normalizeProviderName(value?: string | null) {
-  return (value || "").trim().replace(/\s+/gu, " ").toLowerCase();
-}
-
 function parseTomlStringValue(value: string) {
   const raw = value.trim();
   if (raw.startsWith('"')) {
@@ -558,14 +543,13 @@ function savedProviderApiKey(provider: SavedProvider) {
     || extractTomlProviderApiKey(provider.tomlConfig, providerId || undefined);
 }
 
-function providerIdentityKey(baseUrl?: string | null, apiKey?: string | null, providerName?: string | null) {
-  const normalizedUrl = normalizeProviderBaseUrl(baseUrl);
-  if (!normalizedUrl) return "";
-  const normalizedKey = (apiKey || "").trim();
-  return JSON.stringify([
-    normalizedUrl,
-    normalizedKey ? `key:${normalizedKey}` : `name:${normalizeProviderName(providerName)}`,
-  ]);
+function savedProviderMatchesProfile(provider: SavedProvider, profile: ProviderProfile) {
+  return providerProfilesMatch({
+    baseUrl: provider.baseUrl,
+    providerName: provider.providerName,
+    model: provider.model,
+    apiKey: savedProviderApiKey(provider),
+  }, profile);
 }
 
 function buildProviderTomlPreview(provider: SavedProvider) {
@@ -798,6 +782,8 @@ function App() {
   const [availableProviderModels, setAvailableProviderModels] = React.useState<ProviderModel[]>([]);
   const [providerModelsLoading, setProviderModelsLoading] = React.useState(false);
   const [actionBusy, setActionBusy] = React.useState<string>("");
+  const [skillsMcpNoteBusy, setSkillsMcpNoteBusy] = React.useState("");
+  const [restartCodexBusy, setRestartCodexBusy] = React.useState(false);
   const [promptSyncing, setPromptSyncing] = React.useState(false);
   const [promptCatalogReady, setPromptCatalogReady] = React.useState(false);
   const [promptForm, setPromptForm] = React.useState<SavedPrompt>(blankPromptForm);
@@ -820,6 +806,8 @@ function App() {
   const loadingTokensRef = React.useRef(new Set<number>());
   const actionBusyGenerationRef = React.useRef(0);
   const actionBusyTokensRef = React.useRef(new Map<number, string>());
+  const skillsMcpNoteBusyRef = React.useRef("");
+  const restartCodexBusyRef = React.useRef(false);
   const promptModeHelpRef = React.useRef<HTMLDivElement | null>(null);
   const promptRefreshRequestRef = React.useRef(0);
   const refreshRequestRef = React.useRef(0);
@@ -1084,8 +1072,17 @@ function App() {
     if (state?.activeSavedProviderId && savedProviders.some((item) => item.id === state.activeSavedProviderId)) {
       return state.activeSavedProviderId;
     }
-    return liveProviderId !== "custom" ? liveProviderId : "";
-  }, [liveProviderId, savedProviders, state?.activeSavedProviderId, state?.isOfficialProvider]);
+    const fallback = liveProviderId === "custom"
+      ? savedProviders.find((item) => item.id === activeProviderId)
+      : savedProviders.find((item) => item.id === liveProviderId);
+    if (!fallback || !currentProvider) return "";
+    return savedProviderMatchesProfile(fallback, {
+      baseUrl: currentProvider.baseUrl,
+      apiKey: liveProviderApiKey,
+      providerName: currentProvider.name,
+      model: state?.model,
+    }) ? fallback.id : "";
+  }, [activeProviderId, currentProvider, liveProviderApiKey, liveProviderId, savedProviders, state?.activeSavedProviderId, state?.isOfficialProvider, state?.model]);
   const effectiveActiveProviderId = state?.isOfficialProvider ? "" : inferredActiveProviderId;
   const currentInstructionPath = (state?.instructionFile || "").replace(/\\/g, "/");
   const currentInstructionFilename = currentInstructionPath.split("/").pop() || "";
@@ -1104,22 +1101,6 @@ function App() {
       || currentInstructionFilename
       || (lang === "zh" ? "当前提示词" : "Current prompt");
   }, [currentInstructionFilename, instructionTemplates, lang, savedPrompts, state?.instructionTemplateKey]);
-  const canonicalSavedProviders = React.useMemo(() => {
-    const groups = new Map<string, SavedProvider[]>();
-    savedProviders.forEach((provider) => {
-      const identity = providerIdentityKey(provider.baseUrl, savedProviderApiKey(provider), provider.providerName);
-      const key = identity || `id:${provider.id}`;
-      const group = groups.get(key);
-      if (group) group.push(provider);
-      else groups.set(key, [provider]);
-    });
-    return Array.from(groups.values()).map((group) =>
-      group.find((item) => item.id === effectiveActiveProviderId)
-      || group.find((item) => item.id === activeProviderId)
-      || group[0],
-    );
-  }, [activeProviderId, effectiveActiveProviderId, savedProviders]);
-
   const detectedRows = React.useMemo(() => {
     if (state?.isOfficialProvider) return [];
     return (state?.providers || []).filter((p) => p.isCurrent).map((p) => {
@@ -1140,12 +1121,12 @@ function App() {
   }, [liveProviderApiKey, state?.configText, state?.isOfficialProvider, state?.model, state?.providers]);
 
   const localRows = React.useMemo(() => {
-    return canonicalSavedProviders.map((p) => ({
+    return savedProviders.map((p) => ({
       ...p,
       source: "local" as const,
       isCurrent: effectiveActiveProviderId === p.id,
     }));
-  }, [canonicalSavedProviders, effectiveActiveProviderId]);
+  }, [effectiveActiveProviderId, savedProviders]);
 
   const providerRows = React.useMemo(() => {
     const officialRow = {
@@ -1159,42 +1140,36 @@ function App() {
       requiresOpenaiAuth: false,
       isCurrent: Boolean(state?.isOfficialProvider),
     };
-    const seen = new Set<string>();
-    const rows: Array<typeof officialRow | (typeof detectedRows)[number] | (typeof localRows)[number]> = [officialRow];
-    localRows.forEach((row) => {
-      const key = providerIdentityKey(row.baseUrl, savedProviderApiKey(row), row.providerName);
-      if (key) seen.add(key);
-      rows.push(row);
-    });
-    detectedRows.forEach((row) => {
-      if (row.id === "detected-custom" && inferredActiveProviderId) return;
-      const key = providerIdentityKey(row.baseUrl, row.apiKey, row.providerName);
-      if (key && seen.has(key)) return;
-      if (key) seen.add(key);
-      rows.push(row);
-    });
-    return rows;
-  }, [detectedRows, inferredActiveProviderId, localRows, state?.isOfficialProvider, state?.model]);
+    return orderProviderRows(officialRow, detectedRows, localRows);
+  }, [detectedRows, localRows, state?.isOfficialProvider, state?.model]);
 
   const findLocalProviderForRow = React.useCallback((row: ProviderRow) => {
     if (row.source === "official") return undefined;
-    return canonicalSavedProviders.find((item) =>
-      row.source === "local"
-        ? item.id === row.id
-        : providerIdentityKey(item.baseUrl, savedProviderApiKey(item), item.providerName)
-          === providerIdentityKey(row.baseUrl, row.apiKey, row.providerName),
-    );
-  }, [canonicalSavedProviders]);
+    if (row.source === "local") return savedProviders.find((item) => item.id === row.id);
+    const matches = savedProviders.filter((item) => savedProviderMatchesProfile(item, row));
+    return matches.find((item) => item.id === effectiveActiveProviderId)
+      || matches.find((item) => item.id === activeProviderId)
+      || (matches.length === 1 ? matches[0] : undefined);
+  }, [activeProviderId, effectiveActiveProviderId, savedProviders]);
+
+  const providerCopySourceForRow = React.useCallback((row: ProviderRow): SavedProvider | undefined => {
+    const local = findLocalProviderForRow(row);
+    if (local) return local;
+    if (row.source !== "detected") return undefined;
+    return {
+      id: customProviderId(row.providerName || row.baseUrl),
+      providerName: row.providerName,
+      baseUrl: row.baseUrl,
+      model: row.model,
+      apiKey: row.apiKey || "",
+      tomlConfig: state?.configText || "",
+      wireApi: row.wireApi,
+      requiresOpenaiAuth: row.requiresOpenaiAuth,
+    };
+  }, [findLocalProviderForRow, state?.configText]);
 
   const providerPageRows = React.useMemo<ProviderRow[]>(() => providerRows.map((row) => {
-    const local = row.source === "official"
-      ? undefined
-      : canonicalSavedProviders.find((item) =>
-        row.source === "local"
-          ? item.id === row.id
-          : providerIdentityKey(item.baseUrl, savedProviderApiKey(item), item.providerName)
-            === providerIdentityKey(row.baseUrl, row.apiKey, row.providerName),
-      );
+    const local = findLocalProviderForRow(row);
     return {
       id: row.id,
       source: row.source,
@@ -1207,11 +1182,12 @@ function App() {
       isCurrent: row.isCurrent,
       sourceLabel: row.source === "official" ? (lang === "zh" ? "Codex 登录" : "Codex login") : undefined,
       editable: row.source === "official" || Boolean(local) || row.source === "detected",
+      duplicable: Boolean(providerCopySourceForRow(row)),
       deletable: Boolean(local),
       testable: row.source !== "official",
       testingKey: `${row.source}-${row.id}`,
     };
-  }), [canonicalSavedProviders, lang, providerRows]);
+  }), [findLocalProviderForRow, lang, providerCopySourceForRow, providerRows]);
 
   const visibleSessions = React.useMemo(
     () => (sessionStatus?.sessions || []).filter((item) => showInternalSessions || !item.isSubagent),
@@ -1645,6 +1621,7 @@ function App() {
           configText: tomlConfig,
           apiKey: provider.apiKey || "",
         },
+        providerId: provider.id,
       });
     }
     return invoke<ActionResult>("switch_provider", {
@@ -2113,6 +2090,60 @@ function App() {
     }
   };
 
+  const saveSkillsMcpNote = async (itemKind: SkillsMcpNoteKind, id: string, note: string) => {
+    if (skillsMcpNoteBusyRef.current) return false;
+    const noteBusyKey = `note:${itemKind}:${id}`;
+    skillsMcpNoteBusyRef.current = noteBusyKey;
+    setSkillsMcpNoteBusy(noteBusyKey);
+    const request = beginSkillsMcpRequest();
+    const actionToken = beginActionBusy(noteBusyKey);
+    setError("");
+    try {
+      const result = await invoke<SkillsMcpState>("save_skills_mcp_note", {
+        configDir: request.configDir,
+        itemKind,
+        id,
+        note,
+      });
+      if (!isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) return false;
+      skillsMcpLoadedRef.current = request.configDirKey;
+      setSkillsMcpState(result);
+      setToast(lang === "zh" ? "备注已保存" : "Note saved");
+      return true;
+    } catch (e) {
+      if (isCurrentSkillsMcpRequest(request.requestId, request.configDirKey)) setError(String(e));
+      return false;
+    } finally {
+      endActionBusy(actionToken);
+      if (skillsMcpNoteBusyRef.current === noteBusyKey) {
+        skillsMcpNoteBusyRef.current = "";
+        setSkillsMcpNoteBusy("");
+      }
+    }
+  };
+
+  const restartCodexDesktop = async () => {
+    if (restartCodexBusyRef.current) return false;
+    restartCodexBusyRef.current = true;
+    setRestartCodexBusy(true);
+    const actionToken = beginActionBusy("restartCodexDesktop");
+    setError("");
+    try {
+      const result = await invoke<CodexDesktopRestartResult>("restart_codex_desktop");
+      setToast(result.wasRunning
+        ? (lang === "zh" ? `${result.appName} 已重新启动` : `${result.appName} restarted`)
+        : (lang === "zh" ? `${result.appName} 已启动` : `${result.appName} started`));
+      return true;
+    } catch (e) {
+      setError(String(e));
+      return false;
+    } finally {
+      endActionBusy(actionToken);
+      restartCodexBusyRef.current = false;
+      setRestartCodexBusy(false);
+    }
+  };
+
   const installSkillZipFile = async (file?: File | null) => {
     if (!file) return;
     if (!file.name.toLowerCase().endsWith(".zip")) {
@@ -2220,6 +2251,20 @@ function App() {
     setEditingDetectedProvider(false);
     setProviderForm(provider);
     setProviderTomlDraft(provider.tomlConfig?.trim() || buildProviderTomlPreview(provider));
+    setProviderTomlDirty(false);
+    setProviderMode("form");
+  };
+
+  const openDuplicateProvider = (provider: SavedProvider) => {
+    resetAvailableProviderModels();
+    const duplicate = {
+      ...provider,
+      id: uniqueId(provider.id || provider.providerName, savedProviders.map((item) => item.id)),
+    };
+    setEditingProviderId(null);
+    setEditingDetectedProvider(false);
+    setProviderForm(duplicate);
+    setProviderTomlDraft(duplicate.tomlConfig?.trim() || buildProviderTomlPreview(duplicate));
     setProviderTomlDirty(false);
     setProviderMode("form");
   };
@@ -2575,6 +2620,10 @@ function App() {
                   if (local) openEditProvider(local);
                   else if (row.source === "detected") openEditDetectedProvider(row);
                 }}
+                onDuplicateProvider={(row) => {
+                  const copySource = providerCopySourceForRow(row);
+                  if (copySource) openDuplicateProvider(copySource);
+                }}
                 onDeleteProvider={(row) => {
                   const local = findLocalProviderForRow(row);
                   return local ? removeProvider(local.id, row.isCurrent) : Promise.resolve(false);
@@ -2697,6 +2746,8 @@ function App() {
                 onCheckUpdates={checkSkillUpdatesAction}
                 onToggleSkill={toggleSkillEnabled}
                 onToggleMcp={toggleMcpEnabled}
+                noteBusyKey={skillsMcpNoteBusy}
+                onSaveNote={saveSkillsMcpNote}
               />
             )}
 
@@ -2846,9 +2897,24 @@ function App() {
                     ? "重新检测 CODEX_HOME、config.toml、auth.json 和 SQLite 会话库。"
                     : "Recheck CODEX_HOME, config.toml, auth.json and SQLite session stores.",
                   recheckLabel: lang === "zh" ? "重新检测" : "Recheck",
+                  restartTitle: lang === "zh" ? "Codex 桌面客户端" : "Codex desktop app",
+                  restartDescription: lang === "zh"
+                    ? "重新启动本机的 Codex（ChatGPT）桌面客户端，不会重启 Codex-X。"
+                    : "Restart the local Codex (ChatGPT) desktop app without restarting Codex-X.",
+                  restartLabel: lang === "zh" ? "重启 Codex" : "Restart Codex",
+                  restartTargetLabel: lang === "zh" ? "Codex（ChatGPT）桌面客户端" : "Codex (ChatGPT) desktop app",
+                  restartConfirmTitle: lang === "zh" ? "重启 Codex？" : "Restart Codex?",
+                  restartConfirmDescription: lang === "zh"
+                    ? "正在运行的 Codex 窗口会关闭并重新打开，未保存的输入可能丢失。"
+                    : "The running Codex window will close and reopen. Unsaved input may be lost.",
+                  restartCancelLabel: lang === "zh" ? "取消" : "Cancel",
+                  restartConfirmLabel: lang === "zh" ? "确认重启" : "Restart",
+                  restartingLabel: lang === "zh" ? "正在重启" : "Restarting",
                 }}
                 onLanguageChange={setLang}
                 recheckBusy={loading || refreshing}
+                restartBusy={restartCodexBusy}
+                onRestartCodex={restartCodexDesktop}
                 onRecheck={() => {
                   localStorage.removeItem(STARTUP_WIZARD_SEEN_KEY);
                   setStartupWizardOpen(true);
