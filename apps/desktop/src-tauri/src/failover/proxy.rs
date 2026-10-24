@@ -2903,8 +2903,13 @@ mod tests {
         assert!(partial.contains("first"));
         assert!(backup.observed().is_empty());
         eventually(|| proxy.snapshot().in_flight == 0);
-        assert_eq!(proxy.snapshot().providers[0].state, "closed");
-        assert_eq!(proxy.snapshot().failover_count, 0);
+        let snapshot = proxy.snapshot();
+        assert_eq!(snapshot.providers[0].state, "open");
+        assert_eq!(snapshot.providers[0].total_requests, 1);
+        assert_eq!(snapshot.providers[0].failed_requests, 1);
+        assert_eq!(snapshot.success_count, 0);
+        assert_eq!(snapshot.failure_count, 1);
+        assert_eq!(snapshot.failover_count, 0);
     }
 
     #[test]
