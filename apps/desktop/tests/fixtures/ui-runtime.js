@@ -110,6 +110,27 @@
     return `model_provider = "openai"\nmodel = ${JSON.stringify(model || "fixture-official-model")}\n`;
   }
 
+  function officialModelDraft(configText, replacement) {
+    // Limited to this fixture's simple drafts; production uses Rust toml_edit.
+    if (typeof configText !== "string") throw new Error("Fixture: invalid TOML draft");
+    const lines = configText.split("\n");
+    const table = lines.findIndex(line => /^\s*\[/.test(line));
+    const root = lines.slice(0, table < 0 ? lines.length : table);
+    if (root.some(line => line.includes('"""') || line.includes("'''"))) throw new Error("Fixture: multiline draft requires the native parser");
+    const index = root.findIndex(line => /^\s*model\s*=/.test(line));
+    const match = index < 0 ? null : /^(\s*model\s*=\s*)("(?:\\.|[^"\\])*"|'[^']*')(\s*(?:#.*)?)$/.exec(lines[index]);
+    if (index >= 0 && !match) throw new Error("Fixture: model must be a TOML string");
+    const model = match ? (match[2].startsWith('"') ? JSON.parse(match[2]) : match[2].slice(1, -1)) : null;
+    if (replacement === undefined) return { model, configText };
+    const next = replacement.trim();
+    if (next.length > 256 || /[\s\u0000-\u001f\u007f]/.test(next)) throw new Error("Fixture: invalid model ID");
+    if (index >= 0) {
+      if (next) lines[index] = match[1] + JSON.stringify(next) + match[3];
+      else lines.splice(index, 1);
+    } else if (next) lines.unshift(`model = ${JSON.stringify(next)}`);
+    return { model: next || null, configText: lines.join("\n") };
+  }
+
   function officialAuth(account) {
     return JSON.stringify({
       auth_mode: "chatgpt",
@@ -954,6 +975,16 @@
       case "get_provider_order": return getProviderOrder(args.configDir);
       case "save_provider_order": return saveProviderOrder(args);
       case "repair_provider_model_catalog": return { changed: false };
+      case "list_official_models": return {
+        models: [
+          { id: "gpt-6.1-sol", displayName: "GPT-6.1 Sol", isDefault: true },
+          { id: "gpt-6-astra", displayName: "GPT-6 Astra", isDefault: false },
+          { id: "gpt-6-luna", displayName: "GPT-6 Luna", isDefault: false },
+        ],
+        recommendedModel: "gpt-6.1-sol", source: "bundled", warning: null,
+      };
+      case "update_official_model_draft": return officialModelDraft(args.configText, args.model).configText;
+      case "inspect_official_model_draft": return officialModelDraft(args.configText).model;
       case "list_saved_prompts": return clone(savedPrompts);
       case "get_builtin_prompt_status": return clone(statuses);
       case "list_official_profiles":

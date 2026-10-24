@@ -28,6 +28,8 @@ mod error;
 mod failover;
 mod file_io;
 mod live_config;
+mod official_model_draft;
+mod official_models;
 mod paths;
 mod platform;
 mod prompts;
@@ -1286,6 +1288,31 @@ async fn repair_provider_model_catalog(
 }
 
 #[tauri::command]
+async fn list_official_models(
+    force_refresh: Option<bool>,
+) -> Result<official_models::OfficialModelsResult> {
+    tauri::async_runtime::spawn_blocking(move || {
+        official_models::list_official_models(force_refresh.unwrap_or(false))
+    })
+    .await
+    .map_err(|_| CodexxError::Config("读取官方模型目录失败，请稍后刷新。".into()))
+}
+
+#[tauri::command]
+async fn update_official_model_draft(config_text: String, model: String) -> Result<String> {
+    tauri::async_runtime::spawn_blocking(move || official_model_draft::update(&config_text, &model))
+        .await
+        .map_err(|_| CodexxError::Config("更新模型草稿失败，未修改配置。".into()))?
+}
+
+#[tauri::command]
+async fn inspect_official_model_draft(config_text: String) -> Result<Option<String>> {
+    tauri::async_runtime::spawn_blocking(move || official_model_draft::inspect(&config_text))
+        .await
+        .map_err(|_| CodexxError::Config("读取模型草稿失败。".into()))?
+}
+
+#[tauri::command]
 async fn get_codex_state(config_dir: Option<String>) -> Result<CodexState> {
     tauri::async_runtime::spawn_blocking(move || get_codex_state_inner(config_dir))
         .await
@@ -1988,6 +2015,9 @@ pub fn run() {
             delete_saved_provider,
             get_codex_state,
             repair_provider_model_catalog,
+            list_official_models,
+            update_official_model_draft,
+            inspect_official_model_draft,
             switch_official_provider,
             list_official_profiles,
             get_official_profile,

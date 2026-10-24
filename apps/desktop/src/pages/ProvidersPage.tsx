@@ -32,6 +32,7 @@ import { providerUpstreamApi } from "../providerProtocol";
 import { OfficialAuthImportError, readOfficialAuthImport } from "../officialAuthImport";
 import { ProviderPresetPicker } from "../components/ProviderPresetPicker";
 import { PROVIDER_PRESETS, getProviderPreset, getProviderPresetVariant } from "../providerPresets";
+import { BUNDLED_OFFICIAL_MODELS, officialModelOptions, type OfficialModelCatalog } from "../officialModels";
 import { Button, Checkbox, ModalShell } from "../components/ui";
 import type { ProviderMode, ProviderModelMapping } from "../types";
 import { moveProviderRow, providerRowKey } from "../providerRowOrder";
@@ -171,6 +172,11 @@ export type ProvidersPageProps = {
   providerModelMappings: readonly ProviderModelMapping[];
   onProviderModelMappingsChange: (rows: ProviderModelMapping[]) => void;
   officialForm: OfficialFormValue;
+  officialModels?: OfficialModelCatalog;
+  officialModelsLoading?: boolean;
+  officialDraftSyncing?: boolean;
+  officialDraftSyncError?: string;
+  onRefreshOfficialModels?: () => void;
   officialProfileIsDefault: boolean;
   canLoadCurrentOfficial: boolean;
   officialAuthRef?: Ref<HTMLTextAreaElement>;
@@ -735,6 +741,11 @@ function OfficialForm({
   onPresetSelect,
   onPresetVariantSelect,
   officialForm,
+  officialModels = BUNDLED_OFFICIAL_MODELS,
+  officialModelsLoading = false,
+  officialDraftSyncing = false,
+  officialDraftSyncError = "",
+  onRefreshOfficialModels,
   officialProfileIsDefault,
   canLoadCurrentOfficial,
   officialAuthRef,
@@ -751,7 +762,7 @@ function OfficialForm({
   onLoadCcSwitchOfficial,
   onLoadCurrentOfficial,
   onResetOfficial,
-}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "officialForm" | "officialProfileIsDefault" | "canLoadCurrentOfficial" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialNameChange" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onLoadCurrentOfficial" | "onResetOfficial">) {
+}: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "officialForm" | "officialModels" | "officialModelsLoading" | "officialDraftSyncing" | "officialDraftSyncError" | "onRefreshOfficialModels" | "officialProfileIsDefault" | "canLoadCurrentOfficial" | "officialAuthRef" | "officialTomlRef" | "officialInfo" | "loading" | "actionBusy" | "onCancelMode" | "onOfficialNameChange" | "onOfficialModelChange" | "onOfficialAuthChange" | "onOfficialConfigChange" | "onSaveOfficial" | "onLoadCcSwitchOfficial" | "onLoadCurrentOfficial" | "onResetOfficial">) {
   const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
   const [contextWindowBusy, setContextWindowBusy] = useState(false);
   const [authImportBusy, setAuthImportBusy] = useState(false);
@@ -759,6 +770,8 @@ function OfficialForm({
   const [authImportName, setAuthImportName] = useState("");
   const authFileRef = useRef<HTMLInputElement>(null);
   const authImportRequest = useRef(0);
+  const modelListId = useId();
+  const models = officialModelOptions(officialModels.models, officialForm.model);
   useEffect(() => () => { authImportRequest.current += 1; }, []);
   const loadingCcSwitch = actionBusy === "loadCcSwitchOfficial";
   const loadingCurrent = actionBusy === "loadCurrentOfficial";
@@ -769,7 +782,7 @@ function OfficialForm({
     : "Authentication may be left empty. Save and enable this provider, then sign in through Codex. A copied official provider keeps its authentication and can be renamed.";
 
   const confirmReset = () => {
-    if (!showDefaultActions || formBusy) return;
+    if (!showDefaultActions || formBusy || officialDraftSyncing || officialDraftSyncError) return;
     setResetConfirmOpen(false);
     onResetOfficial();
   };
@@ -801,7 +814,7 @@ function OfficialForm({
         onCancel={onCancelMode}
         disabled={formBusy}
       />
-      <ProviderPresetSection lang={lang} creatingProvider={creatingProvider} selectedPresetId={selectedPresetId} selectedPresetVariantId={selectedPresetVariantId} onPresetSelect={onPresetSelect} onPresetVariantSelect={onPresetVariantSelect} disabled={formBusy} />
+      <ProviderPresetSection lang={lang} creatingProvider={creatingProvider} selectedPresetId={selectedPresetId} selectedPresetVariantId={selectedPresetVariantId} onPresetSelect={onPresetSelect} onPresetVariantSelect={onPresetVariantSelect} disabled={formBusy || officialDraftSyncing} />
       <div className="cx-providers-info-grid">
         <div><span>{copy.officialUrlLabel}</span><code>{officialInfo.officialUrl}</code></div>
         <div><span>{copy.authPathLabel}</span><code>{officialInfo.authPath}</code></div>
@@ -809,12 +822,35 @@ function OfficialForm({
       </div>
       <div className="cx-providers-form-grid cx-providers-form-grid--single">
         <Field label={copy.nameLabel}><input value={officialForm.providerName} onChange={(event) => onOfficialNameChange(event.target.value)} disabled={formBusy} /></Field>
-        <Field label={copy.modelLabel}><input value={officialForm.model} onChange={(event) => onOfficialModelChange(event.target.value)} disabled={formBusy} /></Field>
+        <Field label={copy.modelLabel}>
+          <div className="cx-providers-model-input-row">
+            <input value={officialForm.model} list={modelListId} aria-label={copy.modelLabel}
+              placeholder={lang === "zh" ? "留空则跟随 Codex" : "Leave empty to follow Codex"}
+              onChange={event => onOfficialModelChange(event.target.value)} disabled={formBusy} />
+            <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small cx-providers-fetch-models"
+              disabled={formBusy || officialModelsLoading || !onRefreshOfficialModels} onClick={onRefreshOfficialModels}
+              title={lang === "zh" ? "刷新官方模型目录" : "Refresh official model catalog"} aria-label={lang === "zh" ? "刷新官方模型目录" : "Refresh official model catalog"}>
+              <RefreshCw size={14} className={officialModelsLoading ? "cx-providers-spin" : undefined} aria-hidden="true" />
+              {lang === "zh" ? "刷新" : "Refresh"}
+            </button>
+          </div>
+          <datalist id={modelListId}>{models.map(model => <option key={model.id} value={model.id}>{model.displayName}</option>)}</datalist>
+          <select className="cx-providers-model-select" value={officialForm.model} aria-label={lang === "zh" ? "选择官方模型" : "Choose an official model"}
+            disabled={formBusy} onChange={event => onOfficialModelChange(event.target.value)}>
+            <option value="">{lang === "zh" ? "跟随 Codex" : "Follow Codex"}</option>
+            {models.map(model => <option key={model.id} value={model.id}>{model.displayName || model.id}{model.isDefault ? (lang === "zh" ? "（推荐）" : " (recommended)") : ""}</option>)}
+          </select>
+          <small className="cx-providers-context-hint">{lang === "zh" ? "无需登录；实际可用性以账号为准。" : "No sign-in needed; availability depends on your account."} {officialModels.source === "local"
+            ? (lang === "zh" ? "本机模型目录。" : "Local model catalog.") : (lang === "zh" ? "内置模型目录。" : "Bundled model catalog.")}</small>
+          {officialModels.warning && <small className="cx-providers-context-hint" role="status">{officialModels.warning}</small>}
+          {officialDraftSyncing && <small className="cx-providers-context-hint" role="status">{lang === "zh" ? "正在同步模型与 TOML…" : "Synchronizing the model and TOML…"}</small>}
+          {officialDraftSyncError && <small className="cx-providers-context-error" role="alert">{officialDraftSyncError}</small>}
+        </Field>
       </div>
       <div className="cx-providers-editor-field">
         <div className="cx-providers-context-heading">
           <span>{copy.officialTomlLabel}</span>
-          <ContextWindowControl lang={lang} configText={officialForm.configText} onConfigChange={onOfficialConfigChange} disabled={formBusy} onBusyChange={setContextWindowBusy} />
+          <ContextWindowControl lang={lang} configText={officialForm.configText} onConfigChange={onOfficialConfigChange} disabled={formBusy || officialDraftSyncing} onBusyChange={setContextWindowBusy} />
         </div>
         <textarea
           ref={officialTomlRef}
@@ -828,7 +864,7 @@ function OfficialForm({
       </div>
       <Field label={copy.officialAuthLabel} className="cx-providers-editor-field">
         <div className="cx-providers-context-heading">
-          <button type="button" className="cx-providers-button cx-providers-button--secondary" disabled={formBusy} onClick={() => authFileRef.current?.click()}>
+          <button type="button" className="cx-providers-button cx-providers-button--secondary" disabled={formBusy || officialDraftSyncing} onClick={() => authFileRef.current?.click()}>
             <Download size={14} aria-hidden="true" />{lang === "zh" ? "导入 auth.json 文件" : "Import auth.json file"}
           </button>
           <input ref={authFileRef} type="file" accept=".json,application/json" hidden onChange={event => {
@@ -849,24 +885,24 @@ function OfficialForm({
         />
       </Field>
       <div className="cx-providers-form-actions cx-providers-form-actions--save cx-providers-official-actions">
-        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCurrentOfficial} disabled={formBusy || !canLoadCurrentOfficial}>
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCurrentOfficial} disabled={formBusy || officialDraftSyncing || !canLoadCurrentOfficial}>
           {loadingCurrent
             ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" />
             : <Download size={15} aria-hidden="true" />}
           {lang === "zh" ? "读取当前官方登录" : "Load current official login"}
         </button>
-        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCcSwitchOfficial} disabled={formBusy}>
+        <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={onLoadCcSwitchOfficial} disabled={formBusy || officialDraftSyncing}>
           {loadingCcSwitch
             ? <Loader2 size={15} className="cx-providers-spin" aria-hidden="true" />
             : <Download size={15} aria-hidden="true" />}
           {copy.loadCcSwitchOfficialLabel}
         </button>
         {showDefaultActions && (
-          <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy}>
+          <button type="button" className="cx-providers-button cx-providers-button--secondary" onClick={() => setResetConfirmOpen(true)} disabled={formBusy || officialDraftSyncing || Boolean(officialDraftSyncError)}>
             <FilePlus2 size={15} aria-hidden="true" />{copy.resetOfficialLabel}
           </button>
         )}
-        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={formBusy}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
+        <button type="button" className="cx-providers-button cx-providers-button--primary" onClick={onSaveOfficial} disabled={formBusy || officialDraftSyncing || Boolean(officialDraftSyncError)}><CheckCircle2 size={15} aria-hidden="true" />{copy.officialSaveLabel}</button>
       </div>
       <ModalShell
         open={resetConfirmOpen && showDefaultActions}

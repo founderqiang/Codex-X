@@ -31,6 +31,7 @@ import { applyProviderRowOrder, orderProviderRows } from "./providerRowOrder";
 import { createPresetProvider, getProviderPreset, getProviderPresetVariant } from "./providerPresets";
 import { validateProviderModelMappings } from "./components/ProviderModelMappings";
 import { createOfficialProfileMonitor } from "./officialProfileMonitor";
+import { BUNDLED_OFFICIAL_MODELS, INITIAL_OFFICIAL_MODEL, normalizeOfficialModels, type OfficialModelCatalog } from "./officialModels";
 import { createSessionStatusTracker, providerActivationIsBusy, readCurrentSessionStatus, sessionStatusContextKey } from "./sessionOperationState";
 import type { LoadingScope, SessionStatusContext } from "./sessionOperationState";
 import { useConfigHealth } from "./useConfigHealth";
@@ -592,7 +593,7 @@ function buildProviderTomlPreview(provider: SavedProvider) {
 function buildOfficialTomlPreview(model: string) {
   return [
     `model_provider = "custom"`,
-    `model = "${tomlEscape(model.trim() || "gpt-5.5")}"`,
+    ...(model.trim() ? [`model = "${tomlEscape(model.trim())}"`] : []),
     "",
     "[model_providers.custom]",
     `name = "OpenAI"`,
@@ -826,10 +827,31 @@ function App() {
   const [promptForm, setPromptForm] = React.useState<SavedPrompt>(blankPromptForm);
   const [officialForm, setOfficialForm] = React.useState({
     providerName: "OpenAI Official",
-    model: "gpt-5.5",
+    model: INITIAL_OFFICIAL_MODEL,
     authJson: "",
-    configText: buildOfficialTomlPreview("gpt-5.5"),
+    configText: buildOfficialTomlPreview(INITIAL_OFFICIAL_MODEL),
   });
+  const officialFormRef = React.useRef(officialForm);
+  officialFormRef.current = officialForm;
+  const officialAuthDirtyRef = React.useRef(officialAuthDirty);
+  officialAuthDirtyRef.current = officialAuthDirty;
+  const [officialModels, setOfficialModels] = React.useState(BUNDLED_OFFICIAL_MODELS);
+  const officialModelsRef = React.useRef(officialModels);
+  officialModelsRef.current = officialModels;
+  const [officialModelsLoading, setOfficialModelsLoading] = React.useState(false);
+  const officialModelsRequestRef = React.useRef(0);
+  const officialModelsScopeRef = React.useRef(configDir);
+  officialModelsScopeRef.current = configDir;
+  const officialModelsPendingRef = React.useRef<{ scope: string; promise: Promise<OfficialModelCatalog> } | null>(null);
+  const [officialDraftSyncing, setOfficialDraftSyncing] = React.useState(false);
+  const [officialDraftSyncError, setOfficialDraftSyncError] = React.useState("");
+  const officialDraftSyncErrorRef = React.useRef("");
+  const officialDraftRevisionRef = React.useRef(0);
+  const officialDraftSyncRef = React.useRef<Promise<boolean>>(Promise.resolve(true));
+  const officialDraftPendingEditRef = React.useRef<{ scope: string; edit: "model" | "toml" } | null>(null);
+  const officialModelPristineRef = React.useRef(false);
+  const officialContextRef = React.useRef("");
+  officialContextRef.current = JSON.stringify([configDir, tab, providerMode]);
   const [promptModeHelpOpen, setPromptModeHelpOpen] = React.useState(false);
   const autoUpdateCheckedRef = React.useRef(false);
   const promptImportRef = React.useRef<HTMLInputElement | null>(null);
@@ -884,6 +906,93 @@ function App() {
   const routingRequestRefreshRef = React.useRef<() => void>(() => {});
   const routingUiRef = React.useRef({ ready: false, editing: false });
   routingUiRef.current = { ready: Boolean(state) && !refreshing, editing: providerMode !== "list" };
+
+  const loadOfficialModels = React.useCallback((forceRefresh = false): Promise<OfficialModelCatalog> => {
+    const scope = configDir;
+    if (officialModelsPendingRef.current?.scope === scope) return officialModelsPendingRef.current.promise;
+    const request = ++officialModelsRequestRef.current;
+    setOfficialModelsLoading(true);
+    const promise = invoke<OfficialModelCatalog>("list_official_models", { forceRefresh })
+      .then(normalizeOfficialModels)
+      .catch(() => ({ ...BUNDLED_OFFICIAL_MODELS, warning: lang === "zh"
+        ? "本机模型目录暂不可用，已使用内置目录。" : "The local catalog is unavailable. Using the bundled catalog." }))
+      .then(catalog => {
+        if (request === officialModelsRequestRef.current && officialModelsScopeRef.current === scope
+          && officialModelsPendingRef.current?.scope === scope) {
+          officialModelsRef.current = catalog;
+          setOfficialModels(catalog);
+        }
+        return catalog;
+      })
+      .finally(() => {
+        if (request === officialModelsRequestRef.current) {
+          officialModelsPendingRef.current = null;
+          setOfficialModelsLoading(false);
+        }
+      });
+    officialModelsPendingRef.current = { scope, promise };
+    return promise;
+  }, [configDir, lang]);
+
+  const invalidateOfficialDraftSync = React.useCallback((discard = true) => {
+    officialDraftRevisionRef.current += 1;
+    if (discard) {
+      officialDraftPendingEditRef.current = null;
+      officialDraftSyncErrorRef.current = "";
+      setOfficialDraftSyncError("");
+    }
+    officialDraftSyncRef.current = Promise.resolve(!officialDraftPendingEditRef.current && !officialDraftSyncErrorRef.current);
+    setOfficialDraftSyncing(false);
+  }, []);
+
+  const synchronizeOfficialDraft = (configText: string, model: string, edit: "model" | "toml") => {
+    const revision = ++officialDraftRevisionRef.current;
+    const request = officialDraftRequestRef.current;
+    const context = JSON.stringify([configDir, "provider", "official"]);
+    const isCurrent = () => revision === officialDraftRevisionRef.current
+      && request === officialDraftRequestRef.current && context === officialContextRef.current;
+    officialDraftPendingEditRef.current = { scope: configDir, edit };
+    officialDraftSyncErrorRef.current = "";
+    setOfficialDraftSyncError("");
+    setOfficialDraftSyncing(true);
+    const promise = (edit === "model"
+      ? invoke<string>("update_official_model_draft", { configText, model }).then(text => ({ configText: text, model }))
+      : invoke<string | null>("inspect_official_model_draft", { configText }).then(value => ({ configText, model: value ?? "" })))
+      .then(patch => {
+        if (!isCurrent()) return false;
+        const next = { ...officialFormRef.current, ...patch };
+        officialFormRef.current = next;
+        setOfficialForm(next);
+        officialDraftPendingEditRef.current = null;
+        return true;
+      })
+      .catch(cause => {
+        if (isCurrent()) {
+          officialDraftSyncErrorRef.current = String(cause);
+          setOfficialDraftSyncError(String(cause));
+        }
+        return false;
+      })
+      .finally(() => { if (isCurrent()) setOfficialDraftSyncing(false); });
+    officialDraftSyncRef.current = promise;
+    return promise;
+  };
+
+  const changeOfficialModel = (model: string) => {
+    officialModelPristineRef.current = false;
+    const next = { ...officialFormRef.current, model };
+    officialFormRef.current = next;
+    setOfficialForm(next);
+    void synchronizeOfficialDraft(next.configText, model, "model");
+  };
+
+  const changeOfficialConfig = (configText: string) => {
+    officialModelPristineRef.current = false;
+    const next = { ...officialFormRef.current, configText };
+    officialFormRef.current = next;
+    setOfficialForm(next);
+    void synchronizeOfficialDraft(configText, next.model, "toml");
+  };
 
   const themeTransitionTimerRef = React.useRef<number | null>(null);
   const providerTomlPreview = React.useMemo(() => buildProviderTomlPreview(providerForm), [providerForm]);
@@ -1160,8 +1269,23 @@ function App() {
   React.useEffect(() => {
     if (tab === "provider" && providerMode === "official") return;
     officialDraftRequestRef.current += 1;
+    invalidateOfficialDraftSync(false);
     clearActionBusy("loadOfficialDraft");
-  }, [clearActionBusy, providerMode, tab]);
+  }, [clearActionBusy, invalidateOfficialDraftSync, providerMode, tab]);
+
+  React.useEffect(() => { invalidateOfficialDraftSync(); }, [configDir, invalidateOfficialDraftSync]);
+
+  React.useEffect(() => {
+    if (tab !== "provider" || providerMode !== "official") return;
+    void loadOfficialModels();
+    // A tab change may have cancelled an in-flight response. Resume the user's
+    // last edit direction instead of treating an unsynchronized pair as saved.
+    const pending = officialDraftPendingEditRef.current;
+    if (pending?.scope === configDir) {
+      const form = officialFormRef.current;
+      void synchronizeOfficialDraft(form.configText, form.model, pending.edit);
+    }
+  }, [loadOfficialModels, providerMode, tab]);
 
   React.useEffect(() => {
     if (providerMode !== "official") return;
@@ -2185,25 +2309,33 @@ function App() {
     );
 
   const loadCcSwitchOfficial = async () => {
+    if (officialDraftSyncing) return;
     const requestId = ++officialDraftRequestRef.current;
+    const revision = officialDraftRevisionRef.current;
+    officialModelPristineRef.current = false;
     const actionToken = beginActionBusy("loadCcSwitchOfficial");
     setError("");
     try {
       const candidate = await invoke<OfficialAuthCandidate | null>("read_ccswitch_official_auth", {
         dbPath: null,
       });
-      if (requestId !== officialDraftRequestRef.current) return;
+      if (requestId !== officialDraftRequestRef.current || revision !== officialDraftRevisionRef.current) return;
       if (!candidate) {
         setToast(lang === "zh" ? "未找到 CC Switch 官方配置" : "No CC Switch official config found");
         return;
       }
+      invalidateOfficialDraftSync();
       setOfficialAuthDirty(true);
-      setOfficialForm((current) => ({
+      const current = officialFormRef.current;
+      const next = {
         ...current,
-        model: candidate.model || current.model || state?.model || "gpt-5.5",
+        model: candidate.model || current.model,
         authJson: candidate.authJson,
         configText: candidate.configText || current.configText,
-      }));
+      };
+      officialFormRef.current = next;
+      setOfficialForm(next);
+      void synchronizeOfficialDraft(next.configText, next.model, candidate.configText?.trim() ? "toml" : "model");
       setToast(lang === "zh" ? "已从 CC Switch 载入" : "Loaded from CC Switch");
     } catch (e) {
       if (requestId === officialDraftRequestRef.current) setError(String(e));
@@ -2228,11 +2360,11 @@ function App() {
         setOfficialAuthDirty(false);
         setOfficialForm({
           providerName: officialForm.providerName,
-          model: result.state.model || officialForm.model || "gpt-5.5",
+          model: result.state.model || officialForm.model,
           authJson: "",
           configText: result.state.configText
             || officialForm.configText
-            || buildOfficialTomlPreview(result.state.model || officialForm.model || "gpt-5.5"),
+            || buildOfficialTomlPreview(result.state.model || officialForm.model),
         });
         handleActionResult(result);
       },
@@ -2627,6 +2759,8 @@ function App() {
   const openOfficialEdit = async (profileId = defaultOfficialProfileId) => {
     providerCreationRequestRef.current += 1;
     const requestId = ++officialDraftRequestRef.current;
+    invalidateOfficialDraftSync();
+    officialModelPristineRef.current = false;
     const actionToken = beginActionBusy("loadOfficialDraft");
     const profile = officialProfiles.find((item) => item.id === profileId);
     setEditingDetectedProvider(false);
@@ -2635,7 +2769,7 @@ function App() {
     setOfficialAuthDirty(false);
     setOfficialForm({
       providerName: profile?.providerName || "OpenAI Official",
-      model: profile?.model || "gpt-5.5",
+      model: profile?.model || "",
       authJson: "",
       configText: "",
     });
@@ -2647,12 +2781,15 @@ function App() {
         profileId,
       });
       if (requestId !== officialDraftRequestRef.current) return;
-      setOfficialForm({
+      const next = {
         providerName: draft.providerName,
-        model: draft.model || "gpt-5.5",
+        model: draft.model || "",
         authJson: draft.authJson,
         configText: draft.configText,
-      });
+      };
+      officialFormRef.current = next;
+      setOfficialForm(next);
+      void synchronizeOfficialDraft(next.configText, next.model, "toml");
     } catch (e) {
       if (requestId === officialDraftRequestRef.current) {
         setError(String(e));
@@ -2663,8 +2800,27 @@ function App() {
     }
   };
 
-  const saveOfficialConfig = () => {
-    if (!officialForm.providerName.trim()) {
+  const saveOfficialConfig = async () => {
+    if (loadingTokensRef.current.size || actionBusyTokensRef.current.size) return;
+    const request = officialDraftRequestRef.current;
+    const context = officialContextRef.current;
+    let synchronized = true;
+    // A fast click/keyboard save must wait for the latest model/TOML pair,
+    // including an edit queued while an earlier synchronization was pending.
+    for (;;) {
+      const pending = officialDraftSyncRef.current;
+      synchronized = await pending;
+      if (pending === officialDraftSyncRef.current) break;
+    }
+    if (request !== officialDraftRequestRef.current || context !== officialContextRef.current) return;
+    if (loadingTokensRef.current.size || actionBusyTokensRef.current.size) return;
+    if (!synchronized || officialDraftSyncErrorRef.current) {
+      setError(officialDraftSyncErrorRef.current || (lang === "zh" ? "模型与 TOML 尚未同步，请修正草稿后再保存。" : "The model and TOML draft are not synchronized. Correct the draft before saving."));
+      return;
+    }
+    officialModelPristineRef.current = false;
+    const form = officialFormRef.current;
+    if (!form.providerName.trim()) {
       setError(lang === "zh" ? "请填写供应商名称" : "Provider name is required");
       return;
     }
@@ -2674,10 +2830,10 @@ function App() {
           input: {
             configDir: configDir || null,
             id: editingOfficialProfileId,
-            providerName: officialForm.providerName.trim(),
-            model: officialForm.model,
-            authJson: officialAuthDirty || editingOfficialProfileId === null ? officialForm.authJson : null,
-            configText: officialForm.configText,
+            providerName: form.providerName.trim(),
+            model: form.model,
+            authJson: officialAuthDirtyRef.current || editingOfficialProfileId === null ? form.authJson : null,
+            configText: form.configText,
           },
         }),
       (result) => {
@@ -2689,22 +2845,29 @@ function App() {
   };
 
   const loadCurrentOfficial = async () => {
+    if (officialDraftSyncing) return;
     const requestId = ++officialDraftRequestRef.current;
+    const revision = officialDraftRevisionRef.current;
+    officialModelPristineRef.current = false;
     const actionToken = beginActionBusy("loadCurrentOfficial");
     setError("");
     try {
       const current = await invoke<CodexState>("get_codex_state", { configDir: configDir || null });
-      if (requestId !== officialDraftRequestRef.current) return;
+      if (requestId !== officialDraftRequestRef.current || revision !== officialDraftRevisionRef.current) return;
       if (!current.isOfficialProvider) {
         throw new Error(lang === "zh" ? "请先在 Codex 中切换到官方登录" : "Switch Codex to official sign-in first");
       }
+      invalidateOfficialDraftSync();
       setOfficialAuthDirty(true);
-      setOfficialForm((form) => ({
-        ...form,
-        model: current.model || form.model,
+      const next = {
+        ...officialFormRef.current,
+        model: current.model || "",
         configText: current.configText,
         authJson: current.authText || "",
-      }));
+      };
+      officialFormRef.current = next;
+      setOfficialForm(next);
+      void synchronizeOfficialDraft(next.configText, next.model, "toml");
       setToast(lang === "zh" ? "已读取当前官方登录，保存后保留到此配置" : "Current sign-in loaded. Save to keep it in this profile.");
     } catch (loadError) {
       if (requestId === officialDraftRequestRef.current) setError(String(loadError));
@@ -2729,6 +2892,7 @@ function App() {
 
   const changeProviderKind = async (kind: "api" | "official") => {
     const requestId = ++officialDraftRequestRef.current;
+    invalidateOfficialDraftSync();
     clearActionBusy("loadOfficialDraft");
     if (kind === "api") {
       setProviderMode("form");
@@ -2736,16 +2900,40 @@ function App() {
     }
     setEditingOfficialProfileId(null);
     setProviderMode("official");
-    if (officialForm.configText.trim()) return;
+    if (officialFormRef.current.configText.trim()) {
+      void synchronizeOfficialDraft(officialFormRef.current.configText, officialFormRef.current.model, "toml");
+      return;
+    }
     // Start with a complete official template so a context-window toggle does
     // not turn an otherwise empty draft into a two-line replacement config.
+    const revision = officialDraftRevisionRef.current;
+    const scope = activeConfigDirKeyRef.current;
+    const generation = refreshRequestRef.current;
     const actionToken = beginActionBusy("loadOfficialDraft");
     try {
+      const catalogRequest = loadOfficialModels();
       const template = await invoke<OfficialProfileDetail>("get_official_profile", {
         configDir: configDir || null, profileId: defaultOfficialProfileId,
       });
-      if (requestId !== officialDraftRequestRef.current) return;
-      setOfficialForm((form) => ({ ...form, configText: template.configText, model: template.model || form.model }));
+      const isCurrent = () => requestId === officialDraftRequestRef.current
+        && revision === officialDraftRevisionRef.current && scope === activeConfigDirKeyRef.current
+        && generation === refreshRequestRef.current;
+      if (!isCurrent()) return;
+      const model = officialModelPristineRef.current
+        ? officialModelsRef.current.recommendedModel || INITIAL_OFFICIAL_MODEL : officialFormRef.current.model;
+      const configText = await invoke<string>("update_official_model_draft", { configText: template.configText, model });
+      if (!isCurrent()) return;
+      const next = { ...officialFormRef.current, configText, model };
+      officialFormRef.current = next;
+      setOfficialForm(next);
+      // The template can be edited immediately while local discovery finishes.
+      // Only this untouched creation draft may adopt its explicit recommendation.
+      void catalogRequest.then(catalog => {
+        if (!isCurrent() || !officialModelPristineRef.current || !catalog.recommendedModel
+          || loadingTokensRef.current.size || actionBusyTokensRef.current.size
+          || catalog.recommendedModel === officialFormRef.current.model) return;
+        void synchronizeOfficialDraft(officialFormRef.current.configText, catalog.recommendedModel, "model");
+      });
     } catch (templateError) {
       if (requestId === officialDraftRequestRef.current) {
         setError(String(templateError));
@@ -2777,13 +2965,17 @@ function App() {
         if (requestId !== providerCreationRequestRef.current || requestedDir !== activeConfigDirKeyRef.current
           || contextGeneration !== refreshRequestRef.current) return;
         officialDraftRequestRef.current += 1;
+        invalidateOfficialDraftSync();
+        officialModelPristineRef.current = true;
         setProviderCreationBase(configText);
         setCreatingProvider(true);
         setSelectedPresetId("custom");
         setSelectedPresetVariantId("");
         setEditingOfficialProfileId(null);
         setOfficialAuthDirty(false);
-        setOfficialForm({ providerName: "", model: state?.model || "gpt-5.5", configText: "", authJson: "" });
+        const officialDraft = { providerName: "", model: officialModelsRef.current.recommendedModel || INITIAL_OFFICIAL_MODEL, configText: "", authJson: "" };
+        officialFormRef.current = officialDraft;
+        setOfficialForm(officialDraft);
         const next = newCustomProviderForm(configText);
         resetAvailableProviderModels();
         setEditingProviderId(null);
@@ -3354,6 +3546,11 @@ function App() {
                   requiresOpenaiAuth: providerForm.requiresOpenaiAuth,
                 }}
                 officialForm={officialForm}
+                officialModels={officialModels}
+                officialModelsLoading={officialModelsLoading}
+                officialDraftSyncing={officialDraftSyncing}
+                officialDraftSyncError={officialDraftSyncError}
+                onRefreshOfficialModels={() => { void loadOfficialModels(true); }}
                 officialAuthRef={officialAuthEditorRef}
                 officialTomlRef={officialTomlEditorRef}
                 officialInfo={{
@@ -3417,20 +3614,28 @@ function App() {
                 onResetOfficial={resetOfficialProvider}
                 onCancelMode={() => {
                   officialDraftRequestRef.current += 1;
+                  invalidateOfficialDraftSync();
                   setProviderMode("list");
                   setCreatingProvider(false);
                   setEditingDetectedProvider(false);
                   setProviderTomlDirty(false);
                   setProviderCommonConfigDirty(false);
                 }}
-                onOfficialModelChange={(value) => setOfficialForm((current) => ({ ...current, model: value }))}
-                onOfficialNameChange={(value) => setOfficialForm((current) => ({ ...current, providerName: value }))}
+                onOfficialModelChange={changeOfficialModel}
+                onOfficialNameChange={(value) => {
+                  const next = { ...officialFormRef.current, providerName: value };
+                  officialFormRef.current = next;
+                  setOfficialForm(next);
+                }}
                 onLoadCurrentOfficial={() => void loadCurrentOfficial()}
                 onOfficialAuthChange={(value) => {
+                  officialAuthDirtyRef.current = true;
                   setOfficialAuthDirty(true);
-                  setOfficialForm((current) => ({ ...current, authJson: value }));
+                  const next = { ...officialFormRef.current, authJson: value };
+                  officialFormRef.current = next;
+                  setOfficialForm(next);
                 }}
-                onOfficialConfigChange={(value) => setOfficialForm((current) => ({ ...current, configText: value }))}
+                onOfficialConfigChange={changeOfficialConfig}
                 onSaveOfficial={saveOfficialConfig}
                 onApiKeyChange={(value) => {
                   resetAvailableProviderModels();

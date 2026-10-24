@@ -178,6 +178,59 @@ fn terminate_child(child: &mut Child) {
     wait_for_child_exit(child, Instant::now() + CHILD_TERMINATION_GRACE);
 }
 
+/// Catalog probes own their helper process tree and must not leave an npm/cmd
+/// wrapper's native child holding stdout open after the bounded read finishes.
+pub(crate) fn official_model_command(program: &Path, args: &[&str]) -> Command {
+    #[allow(unused_mut)]
+    let mut command = program_command(program, args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    command
+}
+
+/// Only pass a child spawned using `official_model_command`; its process group
+/// (Unix) or PID subtree (Windows) belongs to this short-lived catalog probe.
+pub(crate) fn terminate_official_model_child(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        if let Ok(mut killer) = Command::new("/bin/kill")
+            .args(["-KILL", "--", group.as_str()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            wait_for_child_exit(&mut killer, deadline);
+            let _ = killer.kill();
+            wait_for_child_exit(&mut killer, Instant::now() + CHILD_TERMINATION_GRACE);
+        }
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let pid = child.id().to_string();
+        if let Ok(mut killer) = program_command(
+            Path::new("taskkill.exe"),
+            &["/PID", pid.as_str(), "/T", "/F"],
+        )
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        {
+            wait_for_child_exit(&mut killer, deadline);
+            let _ = killer.kill();
+            wait_for_child_exit(&mut killer, Instant::now() + CHILD_TERMINATION_GRACE);
+        }
+    }
+    let _ = child.kill();
+    wait_for_child_exit(child, Instant::now() + CHILD_TERMINATION_GRACE);
+}
+
 fn output_reader<R>(mut stream: R) -> Option<mpsc::Receiver<Option<Vec<u8>>>>
 where
     R: Read + Send + 'static,
@@ -473,10 +526,29 @@ where
 }
 
 #[cfg(target_os = "macos")]
+fn macos_bundled_codex_candidates(bundle: &Path) -> Vec<PathBuf> {
+    let resources = bundle.join("Contents/Resources");
+    vec![
+        resources.join("codex-cli/bin/codex"),
+        resources.join("codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+        resources.join("codex"),
+    ]
+}
+
+#[cfg(target_os = "macos")]
 fn visit_platform_candidates<F>(home: &Path, deadline: Option<Instant>, visit: &mut F) -> bool
 where
     F: FnMut(PathBuf) -> bool,
 {
+    // Newer desktop builds package the CLI in codex-cli/ instead of directly
+    // in Resources/. Keep both layouts and the existing PATH-first callers.
+    for bundle in macos_codex_app_paths(home) {
+        for candidate in macos_bundled_codex_candidates(&bundle).into_iter().take(2) {
+            if deadline_expired(deadline) || !visit(candidate) {
+                return false;
+            }
+        }
+    }
     let candidates = [
         PathBuf::from("/Applications/ChatGPT.app/Contents/Resources/codex"),
         home.join("Applications/ChatGPT.app/Contents/Resources/codex"),
@@ -1186,7 +1258,13 @@ pub(crate) fn locale_platform_command(program: &Path, args: &[&str]) -> Result<O
 
 #[cfg(target_os = "macos")]
 pub(crate) fn locale_desktop_app() -> Result<(PathBuf, PathBuf, String, String, String), String> {
-    let deadline = Some(Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT);
+    locale_desktop_app_until(Some(Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT))
+}
+
+#[cfg(target_os = "macos")]
+fn locale_desktop_app_until(
+    deadline: Option<Instant>,
+) -> Result<(PathBuf, PathBuf, String, String, String), String> {
     let apps: Vec<_> = macos_codex_apps(deadline)?
         .into_iter()
         .filter(|app| {
@@ -1515,6 +1593,40 @@ fn codex_executable_candidates_until(deadline: Option<Instant>) -> Vec<PathBuf> 
 
 pub fn codex_executable_candidates() -> Vec<PathBuf> {
     codex_executable_candidates_until(None)
+}
+
+/// Prefer the installed desktop's own catalog over a potentially older PATH
+/// CLI. Other callers retain the original executable-candidate ordering.
+pub(crate) fn official_model_executable_candidates() -> Vec<PathBuf> {
+    // This path runs before a picker can return even a cached catalog. Bound
+    // discovery across desktop detection and extension/profile traversal.
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok((bundle, _, _, _, _)) = locale_desktop_app_until(Some(deadline)) {
+            append_unique_candidates(
+                &mut candidates,
+                &mut seen,
+                macos_bundled_codex_candidates(&bundle),
+            );
+        }
+        let home = dirs::home_dir().unwrap_or_default();
+        for bundle in macos_codex_app_paths(&home) {
+            append_unique_candidates(
+                &mut candidates,
+                &mut seen,
+                macos_bundled_codex_candidates(&bundle),
+            );
+        }
+    }
+    append_unique_candidates(
+        &mut candidates,
+        &mut seen,
+        codex_executable_candidates_until(Some(deadline)),
+    );
+    candidates
 }
 
 fn version_from_candidates(
