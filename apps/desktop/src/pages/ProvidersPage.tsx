@@ -543,7 +543,9 @@ function ListPage({
           <div className="cx-providers-empty" role="status">{copy.noProviders}</div>
         ) : providerRows.map((row) => {
           const balance = providerBalances?.balances.find(item => item.source === row.source && item.providerId === row.id);
-          const showBalance = row.source !== "official" && (balance ? balance.supported : supportsProviderBalance(row.baseUrl));
+          const showBalance = row.source !== "official" && (balance?.vendor === "sub2api"
+            ? balance.supported && !balance.errorCode && balance.balances.length > 0
+            : balance ? balance.supported : supportsProviderBalance(row.baseUrl));
           const testingKey = row.testingKey || `${row.source}-${row.id}`;
           const isTesting = testingId === testingKey;
           const isProtectedOfficial = row.source === "official" && row.isDefaultOfficial === true;
