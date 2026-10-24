@@ -74,6 +74,7 @@ import "./styles/app-shell.css";
 import "./styles/ui-primitives.css";
 import "./styles/app-dialogs.css";
 import "./styles/dark-theme.css";
+import "./styles/form-controls.css";
 
 type Tab = AppTab;
 

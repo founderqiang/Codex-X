@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
@@ -33,7 +33,7 @@ import { OfficialAuthImportError, readOfficialAuthImport } from "../officialAuth
 import { ProviderPresetPicker } from "../components/ProviderPresetPicker";
 import { PROVIDER_PRESETS, getProviderPreset, getProviderPresetVariant } from "../providerPresets";
 import { BUNDLED_OFFICIAL_MODELS, officialModelOptions, type OfficialModelCatalog } from "../officialModels";
-import { Button, Checkbox, ModalShell } from "../components/ui";
+import { Button, Checkbox, ComboBox, ModalShell, Select } from "../components/ui";
 import type { ProviderMode, ProviderModelMapping } from "../types";
 import { moveProviderRow, providerRowKey } from "../providerRowOrder";
 import "../styles/providers-page.css";
@@ -770,7 +770,6 @@ function OfficialForm({
   const [authImportName, setAuthImportName] = useState("");
   const authFileRef = useRef<HTMLInputElement>(null);
   const authImportRequest = useRef(0);
-  const modelListId = useId();
   const models = officialModelOptions(officialModels.models, officialForm.model);
   useEffect(() => () => { authImportRequest.current += 1; }, []);
   const loadingCcSwitch = actionBusy === "loadCcSwitchOfficial";
@@ -820,13 +819,20 @@ function OfficialForm({
         <div><span>{copy.authPathLabel}</span><code>{officialInfo.authPath}</code></div>
         <div><span>{copy.officialCurrentLabel}</span><code>{officialInfo.current}</code></div>
       </div>
-      <div className="cx-providers-form-grid cx-providers-form-grid--single">
+      <div className="cx-providers-form-grid cx-providers-form-grid--official">
         <Field label={copy.nameLabel}><input value={officialForm.providerName} onChange={(event) => onOfficialNameChange(event.target.value)} disabled={formBusy} /></Field>
         <Field label={copy.modelLabel}>
           <div className="cx-providers-model-input-row">
-            <input value={officialForm.model} list={modelListId} aria-label={copy.modelLabel}
-              placeholder={lang === "zh" ? "留空则跟随 Codex" : "Leave empty to follow Codex"}
-              onChange={event => onOfficialModelChange(event.target.value)} disabled={formBusy} />
+            <ComboBox value={officialForm.model} aria-label={copy.modelLabel}
+              placeholder={lang === "zh" ? "输入或选择模型" : "Enter or choose a model"}
+              options={[
+                { value: "", label: lang === "zh" ? "跟随 Codex" : "Follow Codex" },
+                ...models.map(model => ({ value: model.id, label: model.displayName || model.id,
+                  description: model.displayName && model.displayName !== model.id ? model.id : undefined,
+                  badge: model.isDefault ? (lang === "zh" ? "推荐" : "Recommended") : undefined })),
+              ]}
+              emptyText={lang === "zh" ? "没有匹配项，可直接输入模型 ID" : "No matches. You can enter a model ID."}
+              onValueChange={onOfficialModelChange} disabled={formBusy} />
             <button type="button" className="cx-providers-button cx-providers-button--secondary cx-providers-button--small cx-providers-fetch-models"
               disabled={formBusy || officialModelsLoading || !onRefreshOfficialModels} onClick={onRefreshOfficialModels}
               title={lang === "zh" ? "刷新官方模型目录" : "Refresh official model catalog"} aria-label={lang === "zh" ? "刷新官方模型目录" : "Refresh official model catalog"}>
@@ -834,12 +840,6 @@ function OfficialForm({
               {lang === "zh" ? "刷新" : "Refresh"}
             </button>
           </div>
-          <datalist id={modelListId}>{models.map(model => <option key={model.id} value={model.id}>{model.displayName}</option>)}</datalist>
-          <select className="cx-providers-model-select" value={officialForm.model} aria-label={lang === "zh" ? "选择官方模型" : "Choose an official model"}
-            disabled={formBusy} onChange={event => onOfficialModelChange(event.target.value)}>
-            <option value="">{lang === "zh" ? "跟随 Codex" : "Follow Codex"}</option>
-            {models.map(model => <option key={model.id} value={model.id}>{model.displayName || model.id}{model.isDefault ? (lang === "zh" ? "（推荐）" : " (recommended)") : ""}</option>)}
-          </select>
           <small className="cx-providers-context-hint">{lang === "zh" ? "无需登录；实际可用性以账号为准。" : "No sign-in needed; availability depends on your account."} {officialModels.source === "local"
             ? (lang === "zh" ? "本机模型目录。" : "Local model catalog.") : (lang === "zh" ? "内置模型目录。" : "Bundled model catalog.")}</small>
           {officialModels.warning && <small className="cx-providers-context-hint" role="status">{officialModels.warning}</small>}
@@ -960,7 +960,6 @@ function ProviderForm({
   onResetProviderToml,
   onSaveProvider,
 }: Pick<ProvidersPageProps, "lang" | "copy" | "creatingProvider" | "selectedPresetId" | "selectedPresetVariantId" | "onPresetSelect" | "onPresetVariantSelect" | "providerForm" | "providerModelMappings" | "onProviderModelMappingsChange" | "loading" | "editingProviderId" | "providerAuthPreview" | "providerTomlDraft" | "providerTomlRef" | "apiKeyVisible" | "availableModels" | "fetchingModels" | "onCancelMode" | "onApiKeyChange" | "onBaseUrlChange" | "onProviderNameChange" | "onProviderModelChange" | "onFetchModels" | "onUpstreamApiChange" | "onRequiresAuthChange" | "onToggleApiKeyVisibility" | "onProviderTomlDraftChange" | "onProviderHeadersConfigChange" | "onResetProviderToml" | "onSaveProvider">) {
-  const modelListId = useId();
   const [contextWindowBusy, setContextWindowBusy] = useState(false);
   const [headersBusy, setHeadersBusy] = useState(false);
   const [headersValid, setHeadersValid] = useState(true);
@@ -1004,11 +1003,13 @@ function ProviderForm({
           <Field label={copy.nameLabel}><input value={providerForm.providerName} onChange={(event) => onProviderNameChange(event.target.value)} disabled={formBusy} /></Field>
           <Field label={copy.modelLabel}>
             <div className="cx-providers-model-input-row">
-              <input
+              <ComboBox
                 value={providerForm.model}
-                list={availableModels.length ? modelListId : undefined}
+                options={availableModels.map(model => ({ value: model, label: model }))}
                 aria-label={copy.modelLabel}
-                onChange={(event) => onProviderModelChange(event.target.value)}
+                placeholder={lang === "zh" ? "输入或选择模型" : "Enter or choose a model"}
+                emptyText={lang === "zh" ? (availableModels.length ? "没有匹配项，可直接输入模型 ID" : "可手动输入，或刷新获取模型列表") : "Enter a model ID or refresh the model list."}
+                onValueChange={onProviderModelChange}
                 disabled={formBusy}
               />
               <button
@@ -1022,37 +1023,21 @@ function ProviderForm({
                 {fetchingModels
                   ? <Loader2 size={14} className="cx-providers-spin" aria-hidden="true" />
                   : <RefreshCw size={14} aria-hidden="true" />}
-                {fetchingModels ? copy.fetchingModelsLabel : copy.fetchModelsLabel}
+                {lang === "zh" ? "刷新" : "Refresh"}
               </button>
             </div>
-            {availableModels.length > 0 && (
-              <>
-                <datalist id={modelListId}>
-                  {availableModels.map((model) => <option value={model} key={model} />)}
-                </datalist>
-                <select
-                  className="cx-providers-model-select"
-                  value=""
-                  aria-label={copy.chooseModelLabel(availableModels.length)}
-                  disabled={formBusy}
-                  onChange={(event) => {
-                    if (event.target.value) onProviderModelChange(event.target.value);
-                  }}
-                >
-                  <option value="">{copy.chooseModelLabel(availableModels.length)}</option>
-                  {availableModels.map((model) => <option value={model} key={model}>{model}</option>)}
-                </select>
-              </>
-            )}
           </Field>
-          <Field label={lang === "zh" ? "上游接口协议" : "Upstream API protocol"}>
-            <select value={providerUpstreamApi(providerForm)} onChange={(event) => onUpstreamApiChange(event.target.value)} disabled={formBusy}>
-              <option value="responses">OpenAI Responses</option>
-              <option value="chat_completions">OpenAI Chat Completions</option>
-              <option value="anthropic_messages">Claude Messages</option>
-              <option value="gemini">Gemini generateContent</option>
-              {!["responses", "chat_completions", "anthropic_messages", "gemini"].includes(providerUpstreamApi(providerForm)) && <option value={providerUpstreamApi(providerForm)} disabled>{lang === "zh" ? "不支持的协议，请重新选择" : "Unsupported protocol — choose a supported API"}</option>}
-            </select>
+          <Field label={lang === "zh" ? "上游接口协议" : "Upstream API protocol"} className="cx-providers-protocol-field">
+            <Select value={providerUpstreamApi(providerForm)} onValueChange={onUpstreamApiChange} disabled={formBusy}
+              aria-label={lang === "zh" ? "上游接口协议" : "Upstream API protocol"}
+              options={[
+                { value: "responses", label: "OpenAI Responses" },
+                { value: "chat_completions", label: "OpenAI Chat Completions" },
+                { value: "anthropic_messages", label: "Claude Messages" },
+                { value: "gemini", label: "Gemini generateContent" },
+                ...(!["responses", "chat_completions", "anthropic_messages", "gemini"].includes(providerUpstreamApi(providerForm))
+                  ? [{ value: providerUpstreamApi(providerForm), label: lang === "zh" ? "不支持的协议，请重新选择" : "Unsupported protocol — choose again", disabled: true }] : []),
+              ]} />
           </Field>
           {providerUpstreamApi(providerForm) !== "responses" && (
             <p className="cx-providers-field--full cx-providers-protocol-hint">
