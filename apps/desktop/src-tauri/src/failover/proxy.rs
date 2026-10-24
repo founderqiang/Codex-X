@@ -2032,12 +2032,15 @@ fn handle_request(mut request: Request, shared: &Arc<Shared>) {
                 uses_default_model,
             );
             match stream_response(request, status, headers, &first[..count], reader) {
-                // A cancelled client is neutral, including a half-open probe.
-                StreamOutcome::ClientClosed => {}
+                // A client cancellation is neutral unless an upstream failure
+                // was already observed before the client disconnected.
+                StreamOutcome::ClientClosed if !stream_failure.load(Ordering::Acquire) => {}
                 StreamOutcome::Complete if !stream_failure.load(Ordering::Acquire) => {
                     record_completed_success(shared, &mut permit);
                 }
-                StreamOutcome::Complete | StreamOutcome::UpstreamFailure => {
+                StreamOutcome::Complete
+                | StreamOutcome::UpstreamFailure
+                | StreamOutcome::ClientClosed => {
                     // Output has already committed: count the upstream failure
                     // for the next request, never replay this one elsewhere.
                     set_attempt_failure(
