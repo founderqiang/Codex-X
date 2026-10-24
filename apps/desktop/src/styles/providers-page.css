@@ -43,6 +43,7 @@
 }
 
 .cx-providers-header {
+  flex: 0 0 auto;
   align-items: flex-end;
 }
 
@@ -162,18 +163,26 @@
 }
 
 .cx-providers-list {
-  flex: 1 1 auto;
+  flex: 1 1 0;
   min-width: 0;
   min-height: 0;
   display: grid;
+  /* Intrinsic rows must not shrink toward min-height when the list fills up. */
+  grid-auto-rows: max-content;
   align-content: start;
-  gap: 8px;
-  padding-right: 6px;
-  padding-bottom: 8px;
+  gap: 12px;
+  padding: 2px 6px 10px 2px;
+  scroll-padding-block: 10px;
   overflow-x: hidden;
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
+}
+
+.cx-providers-list:focus-visible {
+  outline: 2px solid var(--cx-provider-blue);
+  outline-offset: 3px;
+  border-radius: 8px;
 }
 
 .cx-providers-list::-webkit-scrollbar {
@@ -228,7 +237,7 @@
   grid-template-columns: 18px 42px minmax(0, 1fr) minmax(200px, 300px) minmax(310px, 1fr);
 }
 
-.cx-providers-sort-hint { margin: -7px 1px 12px; color: var(--cx-provider-muted); font-size: 11px; line-height: 1.5; }
+.cx-providers-sort-hint { flex: 0 0 auto; margin: -7px 1px 12px; color: var(--cx-provider-muted); font-size: 11px; line-height: 1.5; }
 .cx-providers-drag-handle { display: grid; place-items: center; width: 22px; height: 34px; margin-left: -2px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--cx-provider-muted); cursor: grab; touch-action: none; user-select: none; }
 .cx-providers-drag-handle:hover:not(:disabled) { background: var(--cx-provider-blue-soft); color: var(--cx-provider-blue); }
 .cx-providers-drag-handle:active { cursor: grabbing; }

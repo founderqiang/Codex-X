@@ -538,7 +538,7 @@ function ListPage({
       </header>
 
       <p className="cx-providers-sort-hint">{lang === "zh" ? "拖动卡片左侧手柄调整顺序，自动保存。" : "Drag the handle on the left to reorder. Changes save automatically."}</p>
-      <div className="cx-providers-list" role="list" ref={listRef}>
+      <div className="cx-providers-list" role="list" aria-label={lang === "zh" ? "供应商列表" : "Providers"} tabIndex={0} ref={listRef}>
         {providerRows.length === 0 ? (
           <div className="cx-providers-empty" role="status">{copy.noProviders}</div>
         ) : providerRows.map((row) => {
