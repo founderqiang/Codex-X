@@ -864,17 +864,20 @@ fn wait_macos_stopped(executable: &Path) -> Result<(), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn launch_macos_codex_app(app: &MacosCodexApp) -> Result<(), String> {
+fn launch_macos_codex_app(app: &MacosCodexApp, home: &Path) -> Result<(), String> {
     let bundle_path = app
         .bundle_path
         .to_str()
         .ok_or("Codex 客户端路径不是有效文本")?;
+    let home = home.to_str().ok_or("Codex 配置目录不是有效文本")?;
     let mut last_error = "未确认 Codex 客户端已启动".to_owned();
     for attempt in 0..2 {
         let arguments = [
             "-n".to_owned(),
             "-a".to_owned(),
             bundle_path.to_owned(),
+            "--env".to_owned(),
+            format!("CODEX_HOME={home}"),
             "--stdin".to_owned(),
             "/dev/null".to_owned(),
             "--stdout".to_owned(),
@@ -883,7 +886,7 @@ fn launch_macos_codex_app(app: &MacosCodexApp) -> Result<(), String> {
             "/dev/null".to_owned(),
         ];
         let output = run_command_with_timeout(
-            macos_open_command(&arguments, false),
+            macos_open_command(&arguments, true),
             None,
             CODEX_DESKTOP_COMMAND_TIMEOUT,
         )
@@ -1252,7 +1255,7 @@ pub(crate) fn locale_quit_desktop(executable: &Path, bundle_id: &str) -> Result<
 }
 
 #[cfg(target_os = "macos")]
-pub fn restart_codex_desktop() -> Result<(String, bool), String> {
+pub fn restart_codex_desktop(home: &Path) -> Result<(String, bool), String> {
     let detection_deadline = Some(Instant::now() + CODEX_DESKTOP_COMMAND_TIMEOUT);
     let apps = macos_codex_apps(detection_deadline)?;
     let mut first_installed = None;
@@ -1272,9 +1275,12 @@ pub fn restart_codex_desktop() -> Result<(String, bool), String> {
         .pop()
         .or(first_installed)
         .ok_or("未找到可重启的 Codex 客户端")?;
-    macos_open_launch_capabilities(false)?;
+    // Validate the selected home and LaunchServices environment support before
+    // quitting; a plain restart must not silently open a different config scope.
+    home.to_str().ok_or("Codex 配置目录不是有效文本")?;
+    macos_open_launch_capabilities(true)?;
     locale_quit_desktop(&app.executable_path, &app.bundle_id)?;
-    launch_macos_codex_app(&app)?;
+    launch_macos_codex_app(&app, home)?;
     Ok((app.app_name, was_running))
 }
 
@@ -1395,8 +1401,8 @@ $runningFlag = if ($wasRunning) { '1' } else { '0' }
 }
 
 #[cfg(target_os = "windows")]
-pub fn restart_codex_desktop() -> Result<(String, bool), String> {
-    desktop_windows::restart()
+pub fn restart_codex_desktop(home: &Path) -> Result<(String, bool), String> {
+    desktop_windows::restart(home)
 }
 
 #[cfg(target_os = "windows")]
@@ -1464,7 +1470,7 @@ fn windows_app_version(_deadline: Option<Instant>) -> Option<String> {
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-pub fn restart_codex_desktop() -> Result<(String, bool), String> {
+pub fn restart_codex_desktop(_home: &Path) -> Result<(String, bool), String> {
     Err("当前平台暂不支持重启 Codex/ChatGPT 桌面客户端".to_string())
 }
 

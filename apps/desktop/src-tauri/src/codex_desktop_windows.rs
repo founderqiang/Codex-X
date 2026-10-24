@@ -481,11 +481,12 @@ Emit $true
     .map(|_| ())
 }
 
-pub(crate) fn restart() -> Result<(String, bool), String> {
+pub(crate) fn restart(home: &Path) -> Result<(String, bool), String> {
     let app = detect_fresh()?;
     validate(&app)?;
+    validate_launch(&app, home)?;
     let was_running = !pids(&app)?.is_empty();
     quit(&app)?;
-    launch(&app, None, None)?;
+    launch(&app, Some(home), None)?;
     Ok((app.name, was_running))
 }

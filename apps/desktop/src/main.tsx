@@ -2538,9 +2538,10 @@ function App() {
     try {
       const result = await invoke<CodexDesktopRestartResult>("restart_codex_desktop", { configDir });
       setLanguageRestartNotice(null);
-      setToast(result.wasRunning
+      const message = result.wasRunning
         ? (lang === "zh" ? `${result.appName} 已重新启动` : `${result.appName} restarted`)
-        : (lang === "zh" ? `${result.appName} 已启动` : `${result.appName} started`));
+        : (lang === "zh" ? `${result.appName} 已启动` : `${result.appName} started`);
+      setToast(result.warning ? `${message}\n${result.warning}` : message);
       return true;
     } catch (e) {
       setError(String(e));

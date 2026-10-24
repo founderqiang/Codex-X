@@ -177,6 +177,7 @@ struct AboutInfo {
 struct CodexDesktopRestartResult {
     app_name: String,
     was_running: bool,
+    warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -726,7 +727,7 @@ async fn get_about_info(config_dir: Option<String>) -> Result<AboutInfo> {
 async fn restart_codex_desktop(
     config_dir: Option<String>,
 ) -> std::result::Result<CodexDesktopRestartResult, String> {
-    let (app_name, was_running) = tauri::async_runtime::spawn_blocking(move || {
+    let (app_name, was_running, warning) = tauri::async_runtime::spawn_blocking(move || {
         let codex_dir = resolve_codex_dir(config_dir.clone()).map_err(|e| e.to_string())?;
         sessions::with_session_maintenance(&codex_dir, || {
             codex_language::restart_client(config_dir)
@@ -738,6 +739,7 @@ async fn restart_codex_desktop(
     Ok(CodexDesktopRestartResult {
         app_name,
         was_running,
+        warning,
     })
 }
 
