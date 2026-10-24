@@ -4,7 +4,7 @@
   // Browser-only fixture. Every command below changes this in-memory model only.
   const clone = (value) => structuredClone(value);
   const codexDir = "/fixture/codex";
-  const defaultOfficialId = "openai-official";
+  let defaultOfficialId = "openai-official";
   const storageKey = "codexx.fixture.backend.v2";
   const counts = {};
   const switches = [];
@@ -263,7 +263,8 @@
     if (saved?.version === 2 && saved.state && Array.isArray(saved.savedProviders)
       && Array.isArray(saved.savedPrompts) && Number.isSafeInteger(saved.nextOfficialId)
       && Array.isArray(saved.officialProfiles)
-      && saved.officialProfiles.some((profile) => profile.id === defaultOfficialId)) {
+      && saved.officialProfiles.some((profile) => profile.id === (saved.defaultOfficialId || defaultOfficialId))) {
+      defaultOfficialId = saved.defaultOfficialId || defaultOfficialId;
       state = saved.state;
       if (saved.failoverSettings?.version === 2) failoverSettings = { ...defaultRoutingSettings(), ...saved.failoverSettings };
       savedProviders = saved.savedProviders;
@@ -290,6 +291,7 @@
         providerOrders: Object.fromEntries(providerOrders),
         savedPrompts,
         nextOfficialId,
+        defaultOfficialId,
         failoverSettings,
         officialProfiles: Array.from(officialProfiles.values()),
       }));
@@ -967,9 +969,13 @@
       case "switch_official_profile": return switchOfficial(args.profileId);
       case "delete_official_profile":
         officialProfile(args.profileId);
-        if (args.profileId === defaultOfficialId) throw new Error("Cannot delete the fixture default official profile");
+        if (officialProfiles.size <= 1) throw new Error("Keep at least one official account");
         if (state.isOfficialProvider && state.activeOfficialProfileId === args.profileId) {
           throw new Error("Switch away before deleting the current fixture official profile");
+        }
+        if (args.profileId === defaultOfficialId) {
+          defaultOfficialId = state.activeOfficialProfileId && officialProfiles.has(state.activeOfficialProfileId)
+            ? state.activeOfficialProfileId : Array.from(officialProfiles.keys()).find(id => id !== args.profileId);
         }
         officialProfiles.delete(args.profileId);
         return undefined;

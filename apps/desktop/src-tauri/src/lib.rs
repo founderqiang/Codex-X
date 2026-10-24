@@ -1301,10 +1301,9 @@ fn get_codex_state_inner(config_dir: Option<String>) -> Result<CodexState> {
 async fn switch_official_provider(config_dir: Option<String>) -> Result<ActionResult> {
     tauri::async_runtime::spawn_blocking(move || {
         failover::with_provider_change(config_dir.clone(), || {
-            let result = switch_official_profile_inner(
-                config_dir,
-                providers::official_profiles::DEFAULT_OFFICIAL_PROFILE_ID.to_string(),
-            )?;
+            let codex_dir = resolve_codex_dir(config_dir.clone())?;
+            let profile_id = providers::official_profiles::default_profile_id(&codex_dir)?;
+            let result = switch_official_profile_inner(config_dir, profile_id)?;
             Ok(finish_provider_selection(
                 result,
                 ActiveProviderSelectionUpdate::ClearIfOfficial,

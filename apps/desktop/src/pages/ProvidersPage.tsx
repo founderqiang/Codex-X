@@ -503,10 +503,15 @@ function ListPage({
   };
 
   const confirmDelete = async () => {
-    if (!providerToDelete || deleting) return;
+    if (!providerToDelete || deleting || providerActionsBusy) return;
+    const latest = providerRows.find((row) => row.source === providerToDelete.source && row.id === providerToDelete.id);
+    if (!latest?.deletable) {
+      setProviderToDelete(null);
+      return;
+    }
     setDeleting(true);
     try {
-      if (await onDeleteProvider(providerToDelete)) setProviderToDelete(null);
+      if (await onDeleteProvider(latest)) setProviderToDelete(null);
     } finally {
       setDeleting(false);
     }
@@ -548,7 +553,7 @@ function ListPage({
             : balance ? balance.supported : supportsProviderBalance(row.baseUrl));
           const testingKey = row.testingKey || `${row.source}-${row.id}`;
           const isTesting = testingId === testingKey;
-          const isProtectedOfficial = row.source === "official" && row.isDefaultOfficial === true;
+          const isProtectedOfficial = row.source === "official" && !row.deletable;
           const key = providerRowKey(row);
           const modelName = row.modelDisplayName || row.model || (lang === "zh" ? "跟随 Codex" : "Follow Codex");
           return (
@@ -650,7 +655,7 @@ function ListPage({
                 {(row.deletable || isProtectedOfficial) && (
                   <ActionIconButton
                     icon={Trash2}
-                    label={isProtectedOfficial ? (lang === "zh" ? "默认官方配置不可删除" : "The default official profile cannot be deleted") : copy.removeLabel}
+                    label={isProtectedOfficial ? (lang === "zh" ? "至少保留一个官方账号" : "Keep at least one official account") : copy.removeLabel}
                     onClick={() => { if (!isProtectedOfficial) setProviderToDelete(row); }}
                     disabled={providerActionsBusy || isProtectedOfficial}
                     danger={!isProtectedOfficial}
