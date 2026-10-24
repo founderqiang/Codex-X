@@ -2,6 +2,13 @@
 
 记录 Codex-X 的新功能、体验改进和问题修复。
 
+## [v0.3.29-local.1] - 2026-10-24（本地测试）
+
+- 修复供应商数量较多时卡片被压缩、模型信息和余额时间挤到边缘的问题；卡片按内容保持高度，统一 12px 间距，列表独立滚动，标题和添加按钮保持可见。
+- 供应商列表可通过键盘聚焦并滚动到顶部或底部。
+- 修复 #71：Chat Completions、Claude Messages、Gemini 协议转换接受 Codex 的 `client_metadata` 并在转换时丢弃该客户端元数据，Responses 直通保留原请求。
+- 改进 #72：Windows 管理员身份导致 Microsoft Store 版 Codex 无法重启时，显示原因和重新以普通权限启动的操作指引。
+
 ## [v0.3.28] - 2026-10-20
 
 - 修复 macOS 中由 Codex-X 重启 Codex 后，退出 Codex-X 导致客户端重载的问题：通过系统 LaunchServices 独立启动官方应用，隔离宿主应用身份、进程组和标准流。
